@@ -90,7 +90,6 @@ sudo ./GAZSI -g E6:00.0 -n c1:00.0 -q 2 -s
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/index.` | GET | Static index page |
-| `/contacts.` | GET | Static contacts page |
 | `/inference?d=<text>` | GET | TensorRT inference endpoint |
 
 ### Inference Example
