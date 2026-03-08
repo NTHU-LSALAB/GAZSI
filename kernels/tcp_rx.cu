@@ -208,17 +208,15 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 							}
 
 							/* Only set PARAM_READY if valid parameter was extracted */
-							if (slot->len > 0) {
-								__threadfence_system();
-								atomicExch((unsigned int*)&slot->ready, UVM_STATUS_PARAM_READY);
+						if (slot->len > 0) {
+							atomicAdd((uint32_t*)&g_inference_ring_buf->pending_count, 1);
+							__threadfence_system();
+							atomicExch((unsigned int*)&slot->ready, UVM_STATUS_PARAM_READY);
 
-								/* Notify http_server via semaphore */
-								if (g_sem_request_gpu != nullptr) {
-									doca_gpu_dev_semaphore_set_status(g_sem_request_gpu, slot_idx,
-									                                   DOCA_GPU_SEMAPHORE_STATUS_READY);
-								}
-
-								atomicAdd((uint32_t*)&g_inference_ring_buf->pending_count, 1);
+							if (g_sem_request_gpu != nullptr) {
+								doca_gpu_dev_semaphore_set_status(g_sem_request_gpu, slot_idx,
+								                                   DOCA_GPU_SEMAPHORE_STATUS_READY);
+							}
 							} else {
 								/* No valid parameter, reset slot to FREE */
 								__threadfence_system();

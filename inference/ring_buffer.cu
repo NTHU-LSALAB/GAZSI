@@ -20,6 +20,9 @@ static struct inference_ring_buffer *g_ring_device = NULL;
 /* Semaphore handle for CPU to GPU notification */
 static struct doca_gpu_semaphore *g_sem_inference_cpu = NULL;
 
+/* Semaphore handle for GPU to CPU request notification */
+static struct doca_gpu_semaphore *g_sem_request_cpu = NULL;
+
 /* GPU kernel to get current GPU clock64() value */
 __global__ void get_gpu_clock_kernel(uint64_t *output) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -108,6 +111,7 @@ void free_inference_ring_buffer(struct inference_ring_buffer *ring)
         g_ring_device = NULL;
     }
     g_sem_inference_cpu = NULL;
+    g_sem_request_cpu = NULL;
 }
 
 /* Set inference result notification semaphore (called after semaphore creation) */
@@ -116,10 +120,16 @@ void set_inference_semaphore_cpu(struct doca_gpu_semaphore *sem_cpu)
     g_sem_inference_cpu = sem_cpu;
 }
 
-/* Set request notification semaphore (GPU to CPU) - no-op, kept for API compatibility */
+/* Set request notification semaphore (GPU to CPU) for semaphore-guided polling */
 void set_request_semaphore_cpu(struct doca_gpu_semaphore *sem_cpu)
 {
-    (void)sem_cpu;  /* Unused - batch read function removed */
+    g_sem_request_cpu = sem_cpu;
+}
+
+/* Get request notification semaphore CPU handle */
+struct doca_gpu_semaphore* get_request_semaphore_cpu(void)
+{
+    return g_sem_request_cpu;
 }
 
 /* CPU write - UVM with explicit CUDA sync for concurrency */
@@ -205,12 +215,11 @@ __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *r
     slot->data[len] = '\0';
     slot->len = len;
 
-    __threadfence_system();
-
-    /* T2: GPU wrote to UVM */
     slot->t2_gpu_wrote_uvm = clock64();
 
-    slot->ready = UVM_STATUS_PARAM_READY;
+    atomicAdd((uint32_t*)&ring->pending_count, 1);
+    __threadfence_system();
+    atomicExch((unsigned int*)&slot->ready, UVM_STATUS_PARAM_READY);
 }
 
 __device__ int gpu_read_inference_result_from_slot(struct inference_ring_buffer *ring, int slot_index, char *output)
