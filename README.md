@@ -50,8 +50,9 @@ GAZSI enables direct GPU processing of network packets, bypassing the CPU for mi
 
 ### Software
 - Ubuntu 20.04/22.04
-- DOCA SDK 2.0+
-- CUDA 11.8+ / 12.x
+- DOCA SDK 2.9+
+- CUDA 12.6+
+- TensorRT 10.4 (last version supporting SM 7.0 / V100)
 - GCC 9+
 
 ## Building
@@ -83,6 +84,7 @@ sudo ./GAZSI -g E6:00.0 -n c1:00.0 -q 2 -s
 #   -n  NIC PCIe address
 #   -q  Number of receive queues (1-4)
 #   -s  Enable HTTP server mode
+#   -e  Path to TensorRT engine file
 ```
 
 ## HTTP Endpoints
@@ -107,43 +109,6 @@ curl "http://10.0.0.6/inference?d=hello%20world"
   "batch_size": 1
 }
 ```
-
-## Project Structure
-
-```
-GAZSI/
-├── main.c                      # Application entry point
-├── kernels/
-│   ├── tcp_rx.cu               # TCP packet receive kernel
-│   ├── http_server.cu          # HTTP request/response handling
-│   └── filters.cuh             # Packet filter functions
-├── inference/
-│   ├── tensorrt.cu             # TensorRT inference wrapper
-│   ├── tensorrt.h              # TensorRT header
-│   ├── ring_buffer.cu          # Lock-free ring buffer
-│   └── ring_buffer.h           # Ring buffer header
-├── doca/
-│   ├── tcp.c                   # TCP queue initialization
-│   ├── flow.c                  # DOCA Flow configuration
-│   ├── common.h                # Common definitions
-│   └── defines.h               # Constants and macros
-├── tcp/
-│   ├── session.c               # TCP session management
-│   └── cpu_rss.c               # CPU RSS fallback
-└── meson.build                 # Build configuration
-```
-
-## Performance
-
-Typical latency breakdown for inference requests:
-
-| Stage | Time |
-|-------|------|
-| T0→T1: Slot Allocation | ~10 us |
-| T1→T2: GPU Write to UVM | ~5 us |
-| T2→T3: CPU Detection | ~50 us |
-| T3→T5: TensorRT Inference | ~500-2000 us |
-| T5→T8: Response Sent | ~100 us |
 
 ## License
 

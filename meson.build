@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 if not flag_enable_gpu_support
-	warning('Skipping compilation of gpunet - Missing GPU support.')
+	warning('Skipping compilation of GAZSI - Missing GPU support.')
 	subdir_done()
 endif
 
@@ -65,7 +65,7 @@ app_inc_dirs += include_directories('tcp')
 app_inc_dirs += include_directories('inference')
 app_inc_dirs += include_directories('kernels')
 
-executable('gpunet',
+executable('GAZSI',
 		app_srcs + vanilla_app_srcs,
 		c_args : gpu_c_args,
 		cuda_args : gpu_cuda_args,
