@@ -37,7 +37,7 @@ GAZSI enables direct GPU processing of network packets, bypassing the CPU for mi
 
 - **Zero-Copy Packet Processing**: Direct NIC-to-GPU data path
 - **Lock-Free Ring Buffer**: Efficient CPU-GPU data exchange (128 slots)
-- **Pending-Count Polling**: One atomic load per poll cycle instead of scanning 128 slots
+- **Semaphore Signaling**: Event-driven CPU-GPU synchronization
 - **Dynamic Batch Inference**: Up to 8 requests per batch
 - **HTTP/1.1 Support**: GET/POST request handling on GPU
 
@@ -50,9 +50,8 @@ GAZSI enables direct GPU processing of network packets, bypassing the CPU for mi
 
 ### Software
 - Ubuntu 20.04/22.04
-- DOCA SDK 2.9+
-- CUDA 12.6+
-- TensorRT 10.4 (last version supporting SM 7.0 / V100)
+- DOCA SDK 2.0+
+- CUDA 11.8+ / 12.x
 - GCC 9+
 
 ## Building
@@ -62,30 +61,28 @@ The project builds as part of the DOCA SDK application framework:
 ```bash
 # Create symlink in DOCA applications directory
 sudo ln -s /path/to/GAZSI \
-    /opt/mellanox/doca/applications/gpu_packet_processing
+    /opt/mellanox/doca/applications/GAZSI
 
 # Build
-meson setup /tmp/build /opt/mellanox/doca/applications \
-    -Denable_all_applications=false \
-    -Denable_gpu_packet_processing=true
-ninja -C /tmp/build
+cd /opt/mellanox/doca/applications
+sudo meson build -Denable_GAZSI=true
+sudo ninja -C build
 ```
 
 ## Usage
 
 ```bash
 # Basic usage
-sudo ./gpunet -g <GPU_PCI> -n <NIC_PCI> -q <NUM_QUEUES>
+sudo ./GAZSI -g <GPU_PCI> -n <NIC_PCI> -q <NUM_QUEUES>
 
-# With HTTP server and TensorRT engine
-sudo ./gpunet -g 84:00.0 -n 07:00.0 -q 1 -s -e /path/to/model.engine
+# With HTTP server
+sudo ./GAZSI -g E6:00.0 -n c1:00.0 -q 2 -s
 
 # Options:
 #   -g  GPU PCIe address
 #   -n  NIC PCIe address
 #   -q  Number of receive queues (1-4)
 #   -s  Enable HTTP server mode
-#   -e  Path to TensorRT engine file
 ```
 
 ## HTTP Endpoints
@@ -116,7 +113,6 @@ curl "http://10.0.0.6/inference?d=hello%20world"
 ```
 GAZSI/
 ├── main.c                      # Application entry point
-├── meson.build                 # Build configuration
 ├── kernels/
 │   ├── tcp_rx.cu               # TCP packet receive kernel
 │   ├── http_server.cu          # HTTP request/response handling
@@ -124,24 +120,17 @@ GAZSI/
 ├── inference/
 │   ├── tensorrt.cu             # TensorRT inference wrapper
 │   ├── tensorrt.h              # TensorRT header
-│   ├── ring_buffer.cu          # Lock-free ring buffer (128-slot UVM)
+│   ├── ring_buffer.cu          # Lock-free ring buffer
 │   └── ring_buffer.h           # Ring buffer header
 ├── doca/
-│   ├── tcp.c                   # TCP queue and semaphore initialization
+│   ├── tcp.c                   # TCP queue initialization
 │   ├── flow.c                  # DOCA Flow configuration
-│   ├── args.c                  # CLI argument parsing
-│   ├── device.c                # DOCA device initialization
-│   ├── http_tx.c               # HTTP TX buffer management
-│   ├── common.h                # Shared struct definitions
-│   ├── defines.h               # Constants and macros
-│   └── packets.h               # Packet structure definitions
+│   ├── common.h                # Common definitions
+│   └── defines.h               # Constants and macros
 ├── tcp/
 │   ├── session.c               # TCP session management
 │   └── cpu_rss.c               # CPU RSS fallback
-├── utils/
-│   ├── utils.c                 # Utility functions
-│   └── utils.h                 # Utility header
-└── models/                     # TensorRT engine files
+└── meson.build                 # Build configuration
 ```
 
 ## Performance
@@ -153,7 +142,7 @@ Typical latency breakdown for inference requests:
 | T0→T1: Slot Allocation | ~10 us |
 | T1→T2: GPU Write to UVM | ~5 us |
 | T2→T3: CPU Detection | ~50 us |
-| T3→T5: TensorRT Inference | ~500-4000 us (model dependent) |
+| T3→T5: TensorRT Inference | ~500-2000 us |
 | T5→T8: Response Sent | ~100 us |
 
 ## License
