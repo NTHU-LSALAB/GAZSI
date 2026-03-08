@@ -14,7 +14,6 @@
 #include "inference/ring_buffer.h"  /* Ring Buffer UVM - supports concurrency */
 #include <pthread.h>
 #include <ctype.h>
-
 #define SLEEP_IN_NANOS (10 * 1000) /* Sample the PE every 10 microseconds  */
 
 /* Buffer and inference constants */
@@ -115,12 +114,14 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
                                char batch_data[][DATA_BUFFER_SIZE],
                                uint32_t *batch_lens,
                                int max_batch) {
+	if (__atomic_load_n(&ring->pending_count, __ATOMIC_ACQUIRE) == 0)
+		return 0;
+
 	int count = 0;
 
 	for (uint32_t i = 0; i < INFERENCE_RING_SIZE && count < max_batch; i++) {
 		struct inference_ring_slot *slot = &ring->slots[i];
 
-		/* Atomic CAS claim: PARAM_READY -> PROCESSING */
 		uint32_t expected = UVM_STATUS_PARAM_READY;
 		if (__atomic_compare_exchange_n(&slot->ready,
 		                                 &expected,
@@ -128,10 +129,9 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 		                                 false,
 		                                 __ATOMIC_ACQ_REL,
 		                                 __ATOMIC_ACQUIRE)) {
-			/* Memory barrier to ensure seeing GPU-written data */
+			__atomic_fetch_sub(&ring->pending_count, 1, __ATOMIC_RELEASE);
 			__sync_synchronize();
 
-			/* Boundary check - slot->len must be within reasonable range */
 			uint32_t data_len = slot->len;
 			if (data_len > MAX_DATA_LEN) {
 				DOCA_LOG_WARN("Slot %u has invalid len=%u, resetting to FREE", i, data_len);
@@ -139,7 +139,6 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 				continue;
 			}
 
-			/* Copy data */
 			batch_slots[count] = i;
 			batch_lens[count] = data_len;
 
@@ -147,10 +146,8 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 			memcpy(batch_data[count], slot->data, copy_len);
 			batch_data[count][copy_len] = '\0';
 
-			/* URL decode */
 			url_decode(batch_data[count]);
 
-			/* T3: CPU detected data */
 			slot->t3_cpu_read = get_timestamp_ns();
 
 			count++;

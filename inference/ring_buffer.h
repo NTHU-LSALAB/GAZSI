@@ -83,10 +83,12 @@ struct inference_ring_buffer {
     volatile uint32_t tail;    /* Consumer (CPU) read position */
     volatile uint64_t next_request_id;
 
-    /* GPU Batch coordination for warp synchronization */
-    volatile uint32_t batch_epoch;        /* Incrementing epoch for batch completion */
-    volatile uint32_t pending_count;      /* Current pending request count */
-    char batch_padding[56];               /* Align to cache line */
+    volatile uint32_t batch_epoch;
+    char batch_padding[108];              /* Pad head/tail group to full 128-byte cache line */
+
+    /* Isolated cache line: GPU atomicAdd, CPU atomic_load/fetch_sub */
+    volatile uint32_t pending_count __attribute__((aligned(128)));
+    char pending_padding[124];
 
     /* Clock sync - set once at init, read-only thereafter */
     struct clock_sync_info clock_sync;
@@ -108,6 +110,9 @@ void set_inference_semaphore_cpu(struct doca_gpu_semaphore *sem_cpu);
 
 /* Set request notification semaphore (GPU -> CPU notification) */
 void set_request_semaphore_cpu(struct doca_gpu_semaphore *sem_cpu);
+
+/* Get request notification semaphore CPU handle (for semaphore-guided polling) */
+struct doca_gpu_semaphore* get_request_semaphore_cpu(void);
 
 /* Free Ring Buffer */
 void free_inference_ring_buffer(struct inference_ring_buffer *ring);
