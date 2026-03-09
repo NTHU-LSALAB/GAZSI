@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cuda/atomic>
 #include <doca_gpunetio_dev_buf.cuh>
 #include <doca_gpunetio_dev_sem.cuh>
 #include <doca_gpunetio_dev_eth_rxq.cuh>
@@ -207,21 +208,27 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 								}
 							}
 
-							/* Only set PARAM_READY if valid parameter was extracted */
-						if (slot->len > 0) {
-							atomicAdd((uint32_t*)&g_inference_ring_buf->pending_count, 1);
-							__threadfence_system();
-							atomicExch((unsigned int*)&slot->ready, UVM_STATUS_PARAM_READY);
+						/* Only set PARAM_READY if valid parameter was extracted */
+					if (slot->len > 0) {
+						cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+							pending_ref(*(uint32_t*)&g_inference_ring_buf->pending_count);
+						cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+							ready_ref(*(uint32_t*)&slot->ready);
 
-							if (g_sem_request_gpu != nullptr) {
-								doca_gpu_dev_semaphore_set_status(g_sem_request_gpu, slot_idx,
-								                                   DOCA_GPU_SEMAPHORE_STATUS_READY);
-							}
-							} else {
-								/* No valid parameter, reset slot to FREE */
-								__threadfence_system();
-								atomicExch((unsigned int*)&slot->ready, UVM_STATUS_FREE);
-							}
+						/* Q3: release store — CPU sees data before status change */
+						pending_ref.fetch_add(1, cuda::memory_order_release);
+						ready_ref.store(UVM_STATUS_PARAM_READY, cuda::memory_order_release);
+
+						if (g_sem_request_gpu != nullptr) {
+							doca_gpu_dev_semaphore_set_status(g_sem_request_gpu, slot_idx,
+							                                   DOCA_GPU_SEMAPHORE_STATUS_READY);
+						}
+						} else {
+							/* No valid parameter, reset slot to FREE */
+							cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+								ready_ref(*(uint32_t*)&slot->ready);
+							ready_ref.store(UVM_STATUS_FREE, cuda::memory_order_release);
+						}
 						}
 				}
 

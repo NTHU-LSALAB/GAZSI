@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cuda/atomic>
 #include <doca_gpunetio_dev_buf.cuh>
 #include <doca_gpunetio_dev_sem.cuh>
 #include <doca_gpunetio_dev_eth_txq.cuh>
@@ -349,9 +350,12 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 					break;
 				}
 
-				/* Reset slot status to FREE */
-				__threadfence_system();
-				atomicExch((unsigned int*)&current_slot->ready, UVM_STATUS_FREE);
+				/* Q3: release store — TX complete, slot recyclable */
+				{
+					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+						ready_ref(*(uint32_t*)&current_slot->ready);
+					ready_ref.store(UVM_STATUS_FREE, cuda::memory_order_release);
+				}
 
 				send_pkts++;
 			}

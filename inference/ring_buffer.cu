@@ -6,6 +6,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -169,10 +170,11 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
 /* GPU-side function: allocate ring slot with concurrency safety */
 __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t *request_id)
 {
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> head_ref(*(uint32_t*)&ring->head);
+
     /* Try up to 64 times (RING_SIZE / 2) to find a free slot */
     for (int attempt = 0; attempt < 64; attempt++) {
-        uint32_t my_head = atomicAdd((uint32_t*)&ring->head, 1);
-        __threadfence_system();
+        uint32_t my_head = head_ref.fetch_add(1, cuda::memory_order_relaxed);
         uint32_t index = my_head % INFERENCE_RING_SIZE;
 
         /* Atomically check and claim slot: FREE -> PROCESSING */
@@ -201,6 +203,9 @@ __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t 
 
 __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *ring, int slot_index, const char *data)
 {
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> pending_ref(*(uint32_t*)&ring->pending_count);
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> ready_ref(*(uint32_t*)&ring->slots[slot_index].ready);
+
     struct inference_ring_slot *slot = &ring->slots[slot_index];
 
     /* Record request start timestamp for end-to-end measurement */
@@ -216,9 +221,9 @@ __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *r
 
     slot->t2_gpu_wrote_uvm = clock64();
 
-    atomicAdd((uint32_t*)&ring->pending_count, 1);
-    __threadfence_system();
-    atomicExch((unsigned int*)&slot->ready, UVM_STATUS_PARAM_READY);
+    /* Q3: release store — CPU sees pending_count increment before PARAM_READY */
+    pending_ref.fetch_add(1, cuda::memory_order_release);
+    ready_ref.store(UVM_STATUS_PARAM_READY, cuda::memory_order_release);
 }
 
 

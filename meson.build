@@ -68,7 +68,7 @@ app_inc_dirs += include_directories('kernels')
 executable('GAZSI',
 		app_srcs + vanilla_app_srcs,
 		c_args : gpu_c_args,
-		cuda_args : gpu_cuda_args,
+		cuda_args : gpu_cuda_args + ['-std=c++17'],
 		dependencies : app_dependencies,
 		include_directories : app_inc_dirs,
 		install: install_apps)
