@@ -80,11 +80,10 @@ struct clock_sync_info {
 struct inference_ring_buffer {
     struct inference_ring_slot slots[INFERENCE_RING_SIZE];
     volatile uint32_t head;    /* Producer (GPU) write position */
-    volatile uint32_t tail;    /* Consumer (CPU) read position */
     volatile uint64_t next_request_id;
 
     volatile uint32_t batch_epoch;
-    char batch_padding[108];              /* Pad head/tail group to full 128-byte cache line */
+    char batch_padding[108];              /* Pad head group to full 128-byte cache line */
 
     /* Isolated cache line: GPU atomicAdd, CPU atomic_load/fetch_sub */
     volatile uint32_t pending_count __attribute__((aligned(128)));
@@ -127,8 +126,6 @@ __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t 
 /* GPU-side store inference data to slot */
 __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *ring, int slot_index, const char *data);
 
-/* GPU-side read result from slot. Returns 1 on success, 0 if result not ready */
-__device__ int gpu_read_inference_result_from_slot(struct inference_ring_buffer *ring, int slot_index, char *output);
 #endif
 
 #ifdef __cplusplus

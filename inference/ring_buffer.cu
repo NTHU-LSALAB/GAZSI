@@ -55,7 +55,6 @@ struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
     }
 
     g_ring_host->head = 0;
-    g_ring_host->tail = 0;
     g_ring_host->next_request_id = 1;
     g_ring_host->batch_epoch = 0;
     g_ring_host->pending_count = 0;
@@ -222,44 +221,4 @@ __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *r
     atomicExch((unsigned int*)&slot->ready, UVM_STATUS_PARAM_READY);
 }
 
-__device__ int gpu_read_inference_result_from_slot(struct inference_ring_buffer *ring, int slot_index, char *output)
-{
-    struct inference_ring_slot *slot = &ring->slots[slot_index];
 
-    /* Poll with fence on every iteration for CPU write visibility */
-    int max_polls = 20000;
-
-    for (int poll = 0; poll < max_polls; poll++) {
-        /* Fence every poll to ensure CPU writes are visible */
-        __threadfence_system();
-
-        /* Volatile read of status */
-        uint32_t current_status = slot->ready;
-
-        if (current_status == UVM_STATUS_RESULT_READY) {
-            /* T7: GPU detected result ready */
-            slot->t7_gpu_read = clock64();
-
-            uint32_t len = slot->len;
-            for (uint32_t i = 0; i < len && i < 895; i++) {
-                output[i] = slot->data[i];
-            }
-            output[len] = '\0';
-
-            /* Reset to FREE for slot reuse */
-            __threadfence_system();
-            atomicExch((unsigned int*)&slot->ready, UVM_STATUS_FREE);
-
-            return 1;
-        }
-
-        /* Yield every 200 polls to give CPU execution time */
-        if (poll % 200 == 0 && poll > 0) {
-            __nanosleep(500);  /* 0.5us */
-        }
-    }
-
-    /* Timeout - mark slot as FREE for reuse */
-    atomicExch((unsigned int*)&slot->ready, UVM_STATUS_FREE);
-    return 0;
-}
