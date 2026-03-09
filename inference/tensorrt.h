@@ -58,6 +58,20 @@ void simple_tokenize_and_infer_with_context(TensorRT_Model_t* model, int context
 void batch_tokenize_and_infer(TensorRT_Model_t* model, const char** texts, int batch_size,
                                float* batch_embeddings, int* token_counts);
 
+/**
+ * @brief Pre-capture CUDA Graphs for batch inference (one per batch size 1..8)
+ *
+ * Eliminates per-inference CPU overhead from setInputShape, setTensorAddress,
+ * and enqueueV3 internal kernel launches. Replaces them with a single
+ * cudaGraphLaunch call (~4 µs vs ~50-200 µs).
+ *
+ * Must be called AFTER load_tensorrt_engine() and warmup.
+ *
+ * @param model A handle to the loaded TensorRT model.
+ * @return 0 on success, -1 on failure (falls back to legacy path automatically)
+ */
+int init_cuda_graphs(TensorRT_Model_t* model);
+
 #ifdef __cplusplus
 }
 #endif

@@ -409,10 +409,16 @@ struct BatchBuffers {
     cudaStream_t stream;
 
     bool initialized;
+
+    // CUDA Graph: pre-captured inference graphs per batch size
+    // graph_exec[bs] captures H2D + enqueueV3 + D2H for batch_size=bs
+    cudaGraphExec_t graph_exec[MAX_BATCH_SIZE + 1];
+    bool graphs_ready;
 };
 
 static BatchBuffers g_batch_buffers = {nullptr, nullptr, nullptr, nullptr, nullptr,
-                                        nullptr, nullptr, nullptr, nullptr, false};
+                                        nullptr, nullptr, nullptr, nullptr, false,
+                                        {}, false};
 
 // Initialize Batch Buffers (called once)
 static void init_batch_buffers() {
@@ -451,6 +457,116 @@ static void init_batch_buffers() {
 
     g_batch_buffers.initialized = true;
     fprintf(stderr, "[BATCH] Batch buffers initialized (max_batch=%d)\n", MAX_BATCH_SIZE);
+}
+
+/*
+ * CUDA Graph Capture for Batch Inference
+ *
+ * Pre-captures the TensorRT inference pipeline (H2D + enqueueV3 + D2H) as
+ * CUDA Graphs, one per batch size (1 to MAX_BATCH_SIZE). This eliminates
+ * per-inference CPU overhead from setInputShape, setTensorAddress, and the
+ * ~50-100 internal kernel launches inside enqueueV3, replacing them with a
+ * single cudaGraphLaunch call (~4 µs).
+ *
+ * Prerequisite: init_batch_buffers() must be called first.
+ * Buffer addresses are fixed at init time and baked into each graph.
+ */
+extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
+    auto* model = static_cast<TensorRT_Context*>(model_ptr);
+
+    if (!model || model->contexts.empty() || !model->contexts[0]) {
+        fprintf(stderr, "[CUDA_GRAPH] Error: model or context not ready\n");
+        return -1;
+    }
+
+    // Ensure batch buffers exist
+    init_batch_buffers();
+    if (!g_batch_buffers.initialized) {
+        fprintf(stderr, "[CUDA_GRAPH] Error: batch buffers not initialized\n");
+        return -1;
+    }
+
+    auto* context = model->contexts[0].get();
+    cudaStream_t stream = g_batch_buffers.stream;
+
+    fprintf(stderr, "[CUDA_GRAPH] Capturing inference graphs for batch sizes 1-%d...\n", MAX_BATCH_SIZE);
+
+    for (int bs = 1; bs <= MAX_BATCH_SIZE; bs++) {
+        // 1. Set shapes and addresses OUTSIDE capture (these are CPU-side state)
+        nvinfer1::Dims input_dims;
+        input_dims.nbDims = 2;
+        input_dims.d[0] = bs;
+        input_dims.d[1] = SEQUENCE_LENGTH;
+
+        context->setInputShape("input_ids", input_dims);
+        context->setInputShape("attention_mask", input_dims);
+        if (model->has_token_type_ids) {
+            context->setInputShape("token_type_ids", input_dims);
+        }
+
+        context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
+        context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
+        if (model->has_token_type_ids) {
+            context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
+        }
+        context->setTensorAddress(model->output_tensor_name.c_str(), g_batch_buffers.d_output);
+        if (model->has_pooler_output && !model->pooler_tensor_name.empty()) {
+            context->setTensorAddress(model->pooler_tensor_name.c_str(), g_batch_buffers.d_pooler_output);
+        }
+
+        // 2. Warm-up run: let TensorRT initialize internal cuBLAS handles etc.
+        if (!context->enqueueV3(stream)) {
+            fprintf(stderr, "[CUDA_GRAPH] Error: warm-up enqueueV3 failed for bs=%d\n", bs);
+            return -1;
+        }
+        cudaStreamSynchronize(stream);
+
+        // 3. Capture: H2D memcpy + enqueueV3 + D2H memcpy
+        size_t input_size = bs * SEQUENCE_LENGTH * sizeof(int64_t);
+        size_t output_size = bs * SEQUENCE_LENGTH * EMBEDDING_DIM * sizeof(float);
+
+        cudaGraph_t graph;
+        cudaError_t err;
+
+        err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[CUDA_GRAPH] Error: cudaStreamBeginCapture failed for bs=%d: %s\n",
+                    bs, cudaGetErrorString(err));
+            return -1;
+        }
+
+        // These memcpy + enqueue operations are recorded, not executed
+        cudaMemcpyAsync(g_batch_buffers.d_input_ids, g_batch_buffers.h_input_ids,
+                        input_size, cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(g_batch_buffers.d_attention_mask, g_batch_buffers.h_attention_mask,
+                        input_size, cudaMemcpyHostToDevice, stream);
+        context->enqueueV3(stream);
+        cudaMemcpyAsync(g_batch_buffers.h_output, g_batch_buffers.d_output,
+                        output_size, cudaMemcpyDeviceToHost, stream);
+
+        err = cudaStreamEndCapture(stream, &graph);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[CUDA_GRAPH] Error: cudaStreamEndCapture failed for bs=%d: %s\n",
+                    bs, cudaGetErrorString(err));
+            return -1;
+        }
+
+        // 4. Instantiate executable graph
+        err = cudaGraphInstantiate(&g_batch_buffers.graph_exec[bs], graph, NULL, NULL, 0);
+        cudaGraphDestroy(graph);  // Original graph no longer needed
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[CUDA_GRAPH] Error: cudaGraphInstantiate failed for bs=%d: %s\n",
+                    bs, cudaGetErrorString(err));
+            return -1;
+        }
+
+        fprintf(stderr, "[CUDA_GRAPH] Captured graph for batch_size=%d (input=%zu, output=%zu bytes)\n",
+                bs, input_size, output_size);
+    }
+
+    g_batch_buffers.graphs_ready = true;
+    fprintf(stderr, "[CUDA_GRAPH] All %d graphs captured successfully\n", MAX_BATCH_SIZE);
+    return 0;
 }
 
 // Batch Tokenization: Convert N texts to batch tensor
@@ -496,58 +612,68 @@ extern "C" void batch_tokenize_and_infer(TensorRT_Model_t* model_ptr, const char
         auto* context = model->contexts[0].get();
         cudaStream_t stream = g_batch_buffers.stream;
 
-        // 1. Batch Tokenization → pinned memory
+        // 1. Batch Tokenization → pinned memory (CPU work, not in graph)
         batch_tokenize(texts, batch_size,
                        g_batch_buffers.h_input_ids, g_batch_buffers.h_attention_mask,
                        token_counts);
 
-        // 2. H2D Copy (async, pinned memory → GPU)
-        size_t input_size = batch_size * SEQUENCE_LENGTH * sizeof(int64_t);
-        size_t output_size = batch_size * SEQUENCE_LENGTH * EMBEDDING_DIM * sizeof(float);
+        // 2. Execute inference: CUDA Graph path vs legacy path
+        if (g_batch_buffers.graphs_ready && batch_size >= 1 && batch_size <= MAX_BATCH_SIZE) {
+            /*
+             * CUDA Graph path: single cudaGraphLaunch replaces:
+             *   - 2× cudaMemcpyAsync (H2D)
+             *   - setInputShape × 2-3
+             *   - setTensorAddress × 4-6
+             *   - enqueueV3 (internally ~50-100 kernel launches)
+             *   - cudaMemcpyAsync (D2H)
+             *
+             * CPU overhead: ~4 µs instead of ~50-200 µs
+             */
+            CUDA_CHECK(cudaGraphLaunch(g_batch_buffers.graph_exec[batch_size], stream));
+        } else {
+            /* Legacy path: fallback if graphs not captured */
+            size_t input_size = batch_size * SEQUENCE_LENGTH * sizeof(int64_t);
+            size_t output_size = batch_size * SEQUENCE_LENGTH * EMBEDDING_DIM * sizeof(float);
 
-        CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_input_ids, g_batch_buffers.h_input_ids,
-                                    input_size, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_attention_mask, g_batch_buffers.h_attention_mask,
-                                    input_size, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_input_ids, g_batch_buffers.h_input_ids,
+                                        input_size, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_attention_mask, g_batch_buffers.h_attention_mask,
+                                        input_size, cudaMemcpyHostToDevice, stream));
 
-        // 3. Set batch input shapes
-        nvinfer1::Dims input_dims;
-        input_dims.nbDims = 2;
-        input_dims.d[0] = batch_size;  // BATCH SIZE!
-        input_dims.d[1] = SEQUENCE_LENGTH;
+            nvinfer1::Dims input_dims;
+            input_dims.nbDims = 2;
+            input_dims.d[0] = batch_size;
+            input_dims.d[1] = SEQUENCE_LENGTH;
 
-        context->setInputShape("input_ids", input_dims);
-        context->setInputShape("attention_mask", input_dims);
-        if (model->has_token_type_ids) {
-            context->setInputShape("token_type_ids", input_dims);
+            context->setInputShape("input_ids", input_dims);
+            context->setInputShape("attention_mask", input_dims);
+            if (model->has_token_type_ids) {
+                context->setInputShape("token_type_ids", input_dims);
+            }
+
+            context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
+            context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
+            if (model->has_token_type_ids) {
+                context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
+            }
+            context->setTensorAddress(model->output_tensor_name.c_str(), g_batch_buffers.d_output);
+            if (model->has_pooler_output && !model->pooler_tensor_name.empty()) {
+                context->setTensorAddress(model->pooler_tensor_name.c_str(), g_batch_buffers.d_pooler_output);
+            }
+
+            if (!context->enqueueV3(stream)) {
+                fprintf(stderr, "[BATCH] Error: enqueueV3 failed\n");
+                return;
+            }
+
+            CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.h_output, g_batch_buffers.d_output,
+                                        output_size, cudaMemcpyDeviceToHost, stream));
         }
 
-        // 4. Bind tensors
-        context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
-        context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
-        if (model->has_token_type_ids) {
-            context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
-        }
-        context->setTensorAddress(model->output_tensor_name.c_str(), g_batch_buffers.d_output);
-        // Bind pooler output if present (required by TensorRT - all outputs must be bound)
-        if (model->has_pooler_output && !model->pooler_tensor_name.empty()) {
-            context->setTensorAddress(model->pooler_tensor_name.c_str(), g_batch_buffers.d_pooler_output);
-        }
-
-        // 5. Execute batch inference
-        if (!context->enqueueV3(stream)) {
-            fprintf(stderr, "[BATCH] Error: enqueueV3 failed\n");
-            return;
-        }
-
-        // 6. D2H Copy (async, GPU → pinned memory)
-        CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.h_output, g_batch_buffers.d_output,
-                                    output_size, cudaMemcpyDeviceToHost, stream));
-
-        // 7. Wait for completion
+        // 3. Wait for completion
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // 8. Extract [CLS] embeddings for each batch item
+        // 4. Extract [CLS] embeddings for each batch item
         // Output shape: [batch_size, seq_len, embedding_dim]
         // [CLS] token is at position 0 for each batch item
         for (int b = 0; b < batch_size; b++) {

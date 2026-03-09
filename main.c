@@ -573,6 +573,12 @@ int main(int argc, char **argv)
 			DOCA_LOG_INFO("[WARMUP] Context %d done (%d iterations)", i, WARMUP_ITERATIONS);
 		}
 		DOCA_LOG_INFO("[WARMUP] All %d contexts warmed up (%d total inferences)", NUM_INFERENCE_THREADS, NUM_INFERENCE_THREADS * WARMUP_ITERATIONS);
+
+		if (init_cuda_graphs(tensorrt_model) == 0) {
+			DOCA_LOG_INFO("CUDA Graphs initialized for batch sizes 1-8");
+		} else {
+			DOCA_LOG_WARN("CUDA Graph init failed, using legacy enqueueV3 path");
+		}
 	} else {
 		DOCA_LOG_WARN("TensorRT model loading failed, inference will be skipped");
 	}
