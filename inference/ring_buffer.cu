@@ -14,6 +14,101 @@
 #include "ring_buffer.h"
 #include <doca_gpunetio.h>
 
+/* ------------------------------------------------------------------ */
+/* FIFO index queue operations                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * GPU push: FAA(tail) for position, then store value into entry.
+ * Multiple GPU threads may push concurrently (MPSC pattern for free_pool).
+ */
+__device__ void gpu_iq_push(struct index_queue *q, int value)
+{
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+        tail_ref(*(uint32_t *)&q->tail);
+    uint32_t pos = tail_ref.fetch_add(1, cuda::memory_order_relaxed) & IQ_MASK;
+
+    cuda::atomic_ref<int32_t, cuda::thread_scope_system>
+        entry_ref(*(int32_t *)&q->entries[pos]);
+
+    /* Spin until slot is consumed (IQ_EMPTY) — bounded by queue capacity */
+    while (entry_ref.load(cuda::memory_order_acquire) != IQ_EMPTY)
+        ;
+    entry_ref.store(value, cuda::memory_order_release);
+}
+
+/*
+ * GPU pop: CAS-loop on head to safely claim a position.
+ * Returns slot index (>= 0) or -1 if empty.
+ */
+__device__ int gpu_iq_pop(struct index_queue *q)
+{
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+        head_ref(*(uint32_t *)&q->head);
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+        tail_ref(*(uint32_t *)&q->tail);
+
+    uint32_t h, t;
+    for (;;) {
+        h = head_ref.load(cuda::memory_order_acquire);
+        t = tail_ref.load(cuda::memory_order_acquire);
+        if (h >= t)
+            return -1;
+        if (head_ref.compare_exchange_weak(h, h + 1,
+                cuda::memory_order_acq_rel, cuda::memory_order_relaxed))
+            break;
+    }
+
+    uint32_t pos = h & IQ_MASK;
+    cuda::atomic_ref<int32_t, cuda::thread_scope_system>
+        entry_ref(*(int32_t *)&q->entries[pos]);
+
+    int32_t val;
+    while ((val = entry_ref.load(cuda::memory_order_acquire)) == IQ_EMPTY)
+        ;
+    entry_ref.store(IQ_EMPTY, cuda::memory_order_release);
+    return (int)val;
+}
+
+/*
+ * CPU push: __atomic FAA(tail), then store value.
+ */
+void cpu_iq_push(struct index_queue *q, int value)
+{
+    uint32_t pos = __atomic_fetch_add((uint32_t *)&q->tail, 1, __ATOMIC_RELAXED) & IQ_MASK;
+    /* Spin until slot is consumed */
+    while (__atomic_load_n((int32_t *)&q->entries[pos], __ATOMIC_ACQUIRE) != IQ_EMPTY)
+        ;
+    __atomic_store_n((int32_t *)&q->entries[pos], value, __ATOMIC_RELEASE);
+}
+
+/*
+ * CPU pop: CAS-loop on head to safely claim a position.
+ * Returns slot index (>= 0) or -1 if empty.
+ */
+int cpu_iq_pop(struct index_queue *q)
+{
+    uint32_t h, t;
+    for (;;) {
+        h = __atomic_load_n((uint32_t *)&q->head, __ATOMIC_ACQUIRE);
+        t = __atomic_load_n((uint32_t *)&q->tail, __ATOMIC_ACQUIRE);
+        if (h >= t)
+            return -1;
+        if (__atomic_compare_exchange_n((uint32_t *)&q->head, &h, h + 1,
+                                         false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+    }
+
+    uint32_t pos = h & IQ_MASK;
+    int32_t val;
+    while ((val = __atomic_load_n((int32_t *)&q->entries[pos], __ATOMIC_ACQUIRE)) == IQ_EMPTY)
+        ;
+    __atomic_store_n((int32_t *)&q->entries[pos], (int32_t)IQ_EMPTY, __ATOMIC_RELEASE);
+    return (int)val;
+}
+
+/* ------------------------------------------------------------------ */
+
 /* Global variables: host and device pointer mapping */
 static struct inference_ring_buffer *g_ring_host = NULL;
 static struct inference_ring_buffer *g_ring_device = NULL;
@@ -59,6 +154,22 @@ struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
     g_ring_host->next_request_id = 1;
     g_ring_host->batch_epoch = 0;
     g_ring_host->pending_count = 0;
+
+    /* Initialize FIFO index queues */
+    g_ring_host->free_pool.head = 0;
+    g_ring_host->free_pool.tail = INFERENCE_RING_SIZE;
+    for (int i = 0; i < IQ_CAPACITY; i++)
+        g_ring_host->free_pool.entries[i] = (i < INFERENCE_RING_SIZE) ? i : IQ_EMPTY;
+
+    g_ring_host->request_queue.head = 0;
+    g_ring_host->request_queue.tail = 0;
+    for (int i = 0; i < IQ_CAPACITY; i++)
+        g_ring_host->request_queue.entries[i] = IQ_EMPTY;
+
+    g_ring_host->response_queue.head = 0;
+    g_ring_host->response_queue.tail = 0;
+    for (int i = 0; i < IQ_CAPACITY; i++)
+        g_ring_host->response_queue.entries[i] = IQ_EMPTY;
 
     /* Clock synchronization - measure actual GPU frequency */
     uint64_t *d_gpu_clock;
@@ -143,22 +254,23 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
 
     struct inference_ring_slot *slot = &g_ring_host->slots[slot_index];
 
-    /* Write inference result data */
+    /* Write inference result data (Q3: fixed overflow — cap at sizeof(data)-1) */
+    uint32_t max_len = sizeof(slot->data) - 1;
     uint32_t len = 0;
-    while (result[len] != '\0' && len < 895) {
+    while (result[len] != '\0' && len < max_len) {
         slot->data[len] = result[len];
         len++;
     }
     slot->data[len] = '\0';
     slot->len = len;
 
-    /* Full memory barrier before updating status */
     __sync_synchronize();
-
-    /* Atomically update status */
     __atomic_store_n(&slot->ready, UVM_STATUS_RESULT_READY, __ATOMIC_RELEASE);
 
-    /* Notify GPU via DOCA semaphore */
+    /* Push to response_queue so GPU TX can find it in O(1) */
+    cpu_iq_push(&g_ring_host->response_queue, (int)slot_index);
+
+    /* Also notify via DOCA semaphore (backward compat) */
     if (g_sem_inference_cpu) {
         doca_gpu_semaphore_set_status(g_sem_inference_cpu, slot_index,
                                       DOCA_GPU_SEMAPHORE_STATUS_READY);
@@ -167,38 +279,23 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
     return 1;
 }
 
-/* GPU-side function: allocate ring slot with concurrency safety */
+/* GPU-side function: allocate ring slot via O(1) free_pool pop */
 __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t *request_id)
 {
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> head_ref(*(uint32_t*)&ring->head);
+    int index = gpu_iq_pop(&ring->free_pool);
+    if (index < 0)
+        return -1;
 
-    /* Try up to 64 times (RING_SIZE / 2) to find a free slot */
-    for (int attempt = 0; attempt < 64; attempt++) {
-        uint32_t my_head = head_ref.fetch_add(1, cuda::memory_order_relaxed);
-        uint32_t index = my_head % INFERENCE_RING_SIZE;
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+        ready_ref(*(uint32_t *)&ring->slots[index].ready);
+    ready_ref.store(UVM_STATUS_PROCESSING, cuda::memory_order_release);
 
-        /* Atomically check and claim slot: FREE -> PROCESSING */
-        uint32_t expected = UVM_STATUS_FREE;
-        uint32_t old_status = atomicCAS((uint32_t*)&ring->slots[index].ready,
-                                        expected, UVM_STATUS_PROCESSING);
+    *request_id = atomicAdd((unsigned long long *)&ring->next_request_id, 1);
+    ring->slots[index].request_id = *request_id;
+    ring->slots[index].len = 0;
+    ring->slots[index].t1_slot_allocated = clock64();
 
-        if (old_status == UVM_STATUS_FREE) {
-            /* Successfully claimed slot */
-            *request_id = atomicAdd((unsigned long long*)&ring->next_request_id, 1);
-            ring->slots[index].request_id = *request_id;
-            ring->slots[index].len = 0;
-
-            /* T1: Slot allocated */
-            ring->slots[index].t1_slot_allocated = clock64();
-
-            return (int)index;
-        }
-
-        /* Slot occupied, try next one */
-    }
-
-    /* Ring buffer full after 64 attempts */
-    return -1;
+    return index;
 }
 
 __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *ring, int slot_index, const char *data)
@@ -208,11 +305,12 @@ __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *r
 
     struct inference_ring_slot *slot = &ring->slots[slot_index];
 
-    /* Record request start timestamp for end-to-end measurement */
     slot->start_timestamp = clock64();
 
+    /* Q3: cap copy at sizeof(data)-1 to prevent overflow */
+    uint32_t max_len = sizeof(slot->data) - 1;
     uint32_t len = 0;
-    while (data[len] != '\0' && len < 895) {
+    while (data[len] != '\0' && len < max_len) {
         slot->data[len] = data[len];
         len++;
     }
@@ -221,9 +319,11 @@ __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *r
 
     slot->t2_gpu_wrote_uvm = clock64();
 
-    /* Q3: release store — CPU sees pending_count increment before PARAM_READY */
     pending_ref.fetch_add(1, cuda::memory_order_release);
     ready_ref.store(UVM_STATUS_PARAM_READY, cuda::memory_order_release);
+
+    /* Push to request_queue so CPU can find this slot in O(1) */
+    gpu_iq_push(&ring->request_queue, slot_index);
 }
 
 

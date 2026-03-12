@@ -13,6 +13,11 @@
 /* Ring Buffer size - 128 performs better than 256 in testing */
 #define INFERENCE_RING_SIZE 128
 
+/* FIFO index queue capacity (must be power-of-2 and > INFERENCE_RING_SIZE) */
+#define IQ_CAPACITY 256
+#define IQ_MASK     (IQ_CAPACITY - 1)
+#define IQ_EMPTY    (-1)   /* Sentinel: slot entry not yet written */
+
 /* UVM buffer states - Producer-Consumer state machine */
 #define UVM_STATUS_FREE         0  /* Buffer is idle */
 #define UVM_STATUS_PARAM_READY  1  /* GPU has written parameters */
@@ -65,6 +70,28 @@ struct inference_ring_slot {
 } __attribute__((aligned(128)));
 
 /*
+ * Lock-free SPSC/MPSC index queue (Q2 optimization)
+ *
+ * Replaces O(N) slot scanning with O(1) FIFO notification.
+ * Three actors push/pop slot indices through dedicated queues
+ * instead of scanning all 128 slots to find target state.
+ *
+ * Memory ordering:
+ *   GPU side: cuda::atomic_ref<T, cuda::thread_scope_system>
+ *   CPU side: __atomic_* builtins with __ATOMIC_ACQUIRE / __ATOMIC_RELEASE
+ *
+ * Push: FAA(tail) → get position → CAS(entry, IQ_EMPTY, value)
+ * Pop:  FAA(head) → get position → spin until entry != IQ_EMPTY → exchange to IQ_EMPTY
+ */
+struct index_queue {
+    volatile uint32_t head __attribute__((aligned(128)));
+    char pad_h[124];
+    volatile uint32_t tail __attribute__((aligned(128)));
+    char pad_t[124];
+    volatile int32_t entries[IQ_CAPACITY] __attribute__((aligned(128)));
+};
+
+/*
  * Clock sync info for GPU/CPU clock conversion
  */
 struct clock_sync_info {
@@ -88,6 +115,17 @@ struct inference_ring_buffer {
     /* Isolated cache line: GPU atomicAdd, CPU atomic_load/fetch_sub */
     volatile uint32_t pending_count __attribute__((aligned(128)));
     char pending_padding[124];
+
+    /*
+     * Q2: O(1) FIFO notification queues (replace O(N) slot scanning)
+     *
+     * free_pool:      GPU TX pushes after send → GPU RX pops for allocation
+     * request_queue:  GPU RX pushes after data write → CPU pops for inference
+     * response_queue: CPU pushes after result write → GPU TX pops for response
+     */
+    struct index_queue free_pool      __attribute__((aligned(128)));
+    struct index_queue request_queue   __attribute__((aligned(128)));
+    struct index_queue response_queue  __attribute__((aligned(128)));
 
     /* Clock sync - set once at init, read-only thereafter */
     struct clock_sync_info clock_sync;
@@ -126,7 +164,15 @@ __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t 
 /* GPU-side store inference data to slot */
 __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *ring, int slot_index, const char *data);
 
+/* GPU-side FIFO queue operations (thread_scope_system atomics) */
+__device__ int  gpu_iq_pop(struct index_queue *q);
+__device__ void gpu_iq_push(struct index_queue *q, int value);
+
 #endif
+
+/* CPU-side FIFO queue operations (__atomic_* builtins) */
+int  cpu_iq_pop(struct index_queue *q);
+void cpu_iq_push(struct index_queue *q, int value);
 
 #ifdef __cplusplus
 }

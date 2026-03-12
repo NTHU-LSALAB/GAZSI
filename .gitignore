@@ -17,6 +17,12 @@ build/
 models/*.onnx
 models/*.engine
 models/*.plan
+models/*_onnx/
+models/m.*
+models/m.layers.*
+models/onnx__*
+models/Constant_*
+models/tinyllama_onnx/
 
 # -----------------------------------------------------------------------------
 # Python

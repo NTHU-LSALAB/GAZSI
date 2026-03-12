@@ -155,67 +155,41 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 		return;
 	}
 
-	/* Poll ring_buffer slots for RESULT_READY (CPU processed results) */
-	int ring_check_idx = warp_id;
-
 	while (DOCA_GPUNETIO_VOLATILE(*exit_cond) == 0) {
 		send_pkts = 0;
 		if (txq && g_inference_ring_buf != nullptr) {
-			bool found_ready = false;
 			int slot_idx = -1;
 			struct inference_ring_slot *current_slot = nullptr;
 
-			/* Poll for RESULT_READY slots */
-			for (int poll_offset = 0; poll_offset < INFERENCE_RING_SIZE && !found_ready; poll_offset++) {
-				int check_idx = (ring_check_idx + poll_offset) % INFERENCE_RING_SIZE;
+			/* Q2: O(1) pop from response_queue (only lane 0 pops) */
+			if (lane_id == 0)
+				slot_idx = gpu_iq_pop(&g_inference_ring_buf->response_queue);
+			slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
 
-				if (g_sem_inference_gpu != nullptr) {
-					enum doca_gpu_semaphore_status sem_status;
-					doca_gpu_dev_semaphore_get_status(g_sem_inference_gpu, check_idx, &sem_status);
-					if (sem_status == DOCA_GPU_SEMAPHORE_STATUS_READY) {
-						uint32_t slot_status = g_inference_ring_buf->slots[check_idx].ready;
-						if (slot_status == UVM_STATUS_RESULT_READY) {
-							slot_idx = check_idx;
-							current_slot = &g_inference_ring_buf->slots[slot_idx];
-							found_ready = true;
-						}
-					}
-				} else {
-					/* Fallback: direct slot status check */
-					uint32_t slot_status = g_inference_ring_buf->slots[check_idx].ready;
-					if (slot_status == UVM_STATUS_RESULT_READY) {
-						slot_idx = check_idx;
-						current_slot = &g_inference_ring_buf->slots[slot_idx];
-						found_ready = true;
-					}
-				}
-			}
-
-			ring_check_idx = (ring_check_idx + 1) % INFERENCE_RING_SIZE;
-
-			if (!found_ready) {
+			if (slot_idx < 0) {
+				__syncwarp();
 				continue;
 			}
 
-			if (lane_id == 0) {
-				printf("[HTTP_SERVER] Found RESULT_READY slot %d (warp %d)\n", slot_idx, warp_id);
-			}
+			current_slot = &g_inference_ring_buf->slots[slot_idx];
 
-			/* Claim slot atomically */
-			if (current_slot != nullptr) {
+			/* Claim slot: CAS RESULT_READY → CONSUMED (safety check) */
+			{
 				uint32_t old_val = 0;
 				if (lane_id == 0) {
 					uint32_t expected = UVM_STATUS_RESULT_READY;
 					old_val = atomicCAS((unsigned int*)&current_slot->ready, expected, UVM_STATUS_CONSUMED);
 				}
-				/* Broadcast result to all lanes */
 				old_val = __shfl_sync(0xffffffff, old_val, 0);
 
 				if (old_val != UVM_STATUS_RESULT_READY) {
-					continue;  /* Another warp claimed this slot */
+					/* Shouldn't happen with queue dispatch — return slot to free_pool */
+					if (lane_id == 0)
+						gpu_iq_push(&g_inference_ring_buf->free_pool, slot_idx);
+					__syncwarp();
+					continue;
 				}
 
-				/* Reset semaphore */
 				if (g_sem_inference_gpu != nullptr) {
 					doca_gpu_dev_semaphore_set_status(g_sem_inference_gpu, slot_idx, DOCA_GPU_SEMAPHORE_STATUS_FREE);
 				}
@@ -350,12 +324,14 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 					break;
 				}
 
-				/* Q3: release store — TX complete, slot recyclable */
+				/* Release slot: store FREE then return to free_pool for O(1) reuse */
 				{
 					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
 						ready_ref(*(uint32_t*)&current_slot->ready);
 					ready_ref.store(UVM_STATUS_FREE, cuda::memory_order_release);
 				}
+				if (lane_id == 0)
+					gpu_iq_push(&g_inference_ring_buf->free_pool, slot_idx);
 
 				send_pkts++;
 			}

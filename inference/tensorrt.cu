@@ -15,9 +15,9 @@
 #include "NvInfer.h"
 #include <cuda_runtime_api.h>
 
-// Constants for MiniLM model
+// Buffer allocation uses MAX_EMBEDDING_DIM; runtime sizes use model->embedding_dim
 #define SEQUENCE_LENGTH 128
-#define EMBEDDING_DIM 768
+#define MAX_EMBEDDING_DIM 4096
 #define NUM_CONTEXTS 4
 
 // Context Pool: Pre-allocated GPU buffers + Pinned Host Memory per execution context
@@ -44,8 +44,8 @@ static std::vector<ContextBuffers> g_context_buffers(NUM_CONTEXTS);
 extern "C" int init_tensorrt_gpu_buffers(int gpu_id) {
     cudaSetDevice(gpu_id);
     size_t input_size = SEQUENCE_LENGTH * sizeof(int64_t);
-    size_t output_size = SEQUENCE_LENGTH * EMBEDDING_DIM * sizeof(float);
-    size_t pooler_size = EMBEDDING_DIM * sizeof(float);
+    size_t output_size = SEQUENCE_LENGTH * MAX_EMBEDDING_DIM * sizeof(float);
+    size_t pooler_size = MAX_EMBEDDING_DIM * sizeof(float);
 
     // Allocate GPU buffers + Pinned Host Memory for Context Pool
     for (int i = 0; i < NUM_CONTEXTS; i++) {
@@ -62,7 +62,7 @@ extern "C" int init_tensorrt_gpu_buffers(int gpu_id) {
         // 2. Allocate Pinned Host Memory (for fast DMA)
         if (cudaHostAlloc(&g_context_buffers[i].h_input_ids, input_size, cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc(&g_context_buffers[i].h_attention_mask, input_size, cudaHostAllocDefault) != cudaSuccess ||
-            cudaHostAlloc(&g_context_buffers[i].h_output, EMBEDDING_DIM * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            cudaHostAlloc(&g_context_buffers[i].h_output, MAX_EMBEDDING_DIM * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
             fprintf(stderr, "[TensorRT] Failed to allocate pinned host memory for context %d\n", i);
             return -1;
         }
@@ -328,9 +328,9 @@ extern "C" void simple_tokenize_and_infer_with_context(TensorRT_Model_t* model_p
         *token_count = tokenize_text(text, buffers.h_input_ids, buffers.h_attention_mask);
 
         size_t input_size = SEQUENCE_LENGTH * sizeof(int64_t);
-        size_t output_size = EMBEDDING_DIM * sizeof(float);
+        int embed_dim = model->embedding_dim;
+        size_t output_size = embed_dim * sizeof(float);
 
-        // Use pre-allocated stream and cudaMemcpyAsync (pinned memory supports DMA)
         cudaStream_t stream = buffers.stream;
 
         // Async copy to GPU (pinned memory → device memory via DMA)
@@ -376,7 +376,7 @@ extern "C" void simple_tokenize_and_infer_with_context(TensorRT_Model_t* model_p
     } catch (const std::exception& e) {
         fprintf(stderr, "[CONTEXT_POOL] Error in context %d: %s\n", context_id, e.what());
         *token_count = 0;
-        for (int i = 0; i < EMBEDDING_DIM; i++) {
+        for (int i = 0; i < model->embedding_dim; i++) {
             embeddings[i] = 0.0f;
         }
     }
@@ -425,8 +425,8 @@ static void init_batch_buffers() {
     if (g_batch_buffers.initialized) return;
 
     size_t input_size = MAX_BATCH_SIZE * SEQUENCE_LENGTH * sizeof(int64_t);
-    size_t output_size = MAX_BATCH_SIZE * SEQUENCE_LENGTH * EMBEDDING_DIM * sizeof(float);
-    size_t pooler_size = MAX_BATCH_SIZE * EMBEDDING_DIM * sizeof(float);
+    size_t output_size = MAX_BATCH_SIZE * SEQUENCE_LENGTH * MAX_EMBEDDING_DIM * sizeof(float);
+    size_t pooler_size = MAX_BATCH_SIZE * MAX_EMBEDDING_DIM * sizeof(float);
 
     // GPU buffers
     if (cudaMalloc(&g_batch_buffers.d_input_ids, input_size) != cudaSuccess ||
@@ -521,9 +521,8 @@ extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
         }
         cudaStreamSynchronize(stream);
 
-        // 3. Capture: H2D memcpy + enqueueV3 + D2H memcpy
         size_t input_size = bs * SEQUENCE_LENGTH * sizeof(int64_t);
-        size_t output_size = bs * SEQUENCE_LENGTH * EMBEDDING_DIM * sizeof(float);
+        size_t output_size = bs * SEQUENCE_LENGTH * model->embedding_dim * sizeof(float);
 
         cudaGraph_t graph;
         cudaError_t err;
@@ -633,7 +632,7 @@ extern "C" void batch_tokenize_and_infer(TensorRT_Model_t* model_ptr, const char
         } else {
             /* Legacy path: fallback if graphs not captured */
             size_t input_size = batch_size * SEQUENCE_LENGTH * sizeof(int64_t);
-            size_t output_size = batch_size * SEQUENCE_LENGTH * EMBEDDING_DIM * sizeof(float);
+            size_t output_size = batch_size * SEQUENCE_LENGTH * model->embedding_dim * sizeof(float);
 
             CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_input_ids, g_batch_buffers.h_input_ids,
                                         input_size, cudaMemcpyHostToDevice, stream));
@@ -676,17 +675,19 @@ extern "C" void batch_tokenize_and_infer(TensorRT_Model_t* model_ptr, const char
         // 4. Extract [CLS] embeddings for each batch item
         // Output shape: [batch_size, seq_len, embedding_dim]
         // [CLS] token is at position 0 for each batch item
+        int edim = model->embedding_dim;
         for (int b = 0; b < batch_size; b++) {
-            float* src = &g_batch_buffers.h_output[b * SEQUENCE_LENGTH * EMBEDDING_DIM];  // [CLS] at position 0
-            float* dst = &batch_embeddings[b * EMBEDDING_DIM];
-            memcpy(dst, src, EMBEDDING_DIM * sizeof(float));
+            float* src = &g_batch_buffers.h_output[b * SEQUENCE_LENGTH * edim];
+            float* dst = &batch_embeddings[b * edim];
+            memcpy(dst, src, edim * sizeof(float));
         }
 
     } catch (const std::exception& e) {
         fprintf(stderr, "[BATCH] Exception: %s\n", e.what());
+        int edim = model->embedding_dim;
         for (int b = 0; b < batch_size; b++) {
             token_counts[b] = 0;
-            memset(&batch_embeddings[b * EMBEDDING_DIM], 0, EMBEDDING_DIM * sizeof(float));
+            memset(&batch_embeddings[b * edim], 0, edim * sizeof(float));
         }
     }
 }
