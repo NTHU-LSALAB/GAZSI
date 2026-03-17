@@ -257,10 +257,12 @@ void* simple_inference_reader(void* arg) {
 				double save_us = c0_est / ((double)batch_size * (batch_size + 1));
 
 				while ((1.0 / lambda_now) <= save_us && batch_size < BATCH_MAX_SIZE) {
-					useconds_t wait = (useconds_t)(1.0 / lambda_now);
-					if (wait > ADAPTIVE_MAX_WAIT_US) wait = ADAPTIVE_MAX_WAIT_US;
-					if (wait < IDLE_SLEEP_US) wait = IDLE_SLEEP_US;
-					usleep(wait);
+					double wait_us = 1.0 / lambda_now;
+					if (wait_us > ADAPTIVE_MAX_WAIT_US) wait_us = ADAPTIVE_MAX_WAIT_US;
+					uint64_t spin_until = get_timestamp_ns()
+					                    + (uint64_t)(wait_us * 1000.0);
+					while (get_timestamp_ns() < spin_until)
+						__asm__ __volatile__("pause" ::: "memory");
 
 					int more = collect_ready_slots(g_inference_ring_buf,
 					                               &batch_slots[batch_size],
