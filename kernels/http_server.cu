@@ -25,11 +25,10 @@ __device__ unsigned long long g_tx_buf_counter = 0;
 #define HTTP_BODY_TEMP_OFFSET  256  /* Temporary offset for body construction */
 #define HTTP_BODY_MAX_LEN      900  /* Max body length before truncation */
 
-/* Pre-constructed HTTP Response Template for efficiency */
 #define HTTP_RESP_PREFIX "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-#define HTTP_RESP_PREFIX_LEN 65  /* strlen(HTTP_RESP_PREFIX) - verified with Python */
+#define HTTP_RESP_PREFIX_LEN 65
 #define HTTP_RESP_SUFFIX "\r\nConnection: keep-alive\r\n\r\n"
-#define HTTP_RESP_SUFFIX_LEN 28  /* strlen(HTTP_RESP_SUFFIX) - verified with Python */
+#define HTTP_RESP_SUFFIX_LEN 28
 
 /* Warp-level parallel memcpy - each lane copies dst[lane_id], dst[lane_id+32], ... */
 __device__ static inline void warp_memcpy(char *dst, const char *src, int len, int lane_id)
@@ -277,25 +276,22 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 							body_start[body_len] = '\0';
 						}
 
-						/* Build HTTP headers */
-						for (int i = 0; i < HTTP_RESP_PREFIX_LEN; i++)
-							response_buf[i] = HTTP_RESP_PREFIX[i];
+						/* Content-Length is the only variable part; compute it first */
 						header_len = HTTP_RESP_PREFIX_LEN;
 						header_len += int_to_str(response_buf + header_len, body_len);
-						for (int i = 0; i < HTTP_RESP_SUFFIX_LEN; i++)
-							response_buf[header_len + i] = HTTP_RESP_SUFFIX[i];
-						header_len += HTTP_RESP_SUFFIX_LEN;
-						nbytes_page = header_len + body_len;
+						nbytes_page = header_len + HTTP_RESP_SUFFIX_LEN + body_len;
 					}
 
-					/* Broadcast to all lanes for parallel copy */
 					header_len = __shfl_sync(0xffffffff, header_len, 0);
 					body_len = __shfl_sync(0xffffffff, body_len, 0);
 					nbytes_page = __shfl_sync(0xffffffff, nbytes_page, 0);
 
-					/* Warp-level parallel body copy */
+					/* Warp-parallel: prefix, suffix, and body copy */
+					warp_memcpy(response_buf, HTTP_RESP_PREFIX, HTTP_RESP_PREFIX_LEN, lane_id);
+					__syncwarp();
+					warp_memcpy(response_buf + header_len, HTTP_RESP_SUFFIX, HTTP_RESP_SUFFIX_LEN, lane_id);
 					char *body_src = response_buf + HTTP_BODY_TEMP_OFFSET;
-					warp_memcpy(response_buf + header_len, body_src, body_len, lane_id);
+					warp_memcpy(response_buf + header_len + HTTP_RESP_SUFFIX_LEN, body_src, body_len, lane_id);
 				}
 
 				raw_to_tcp(buf_addr, &hdr, &payload);

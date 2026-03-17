@@ -5,6 +5,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <rte_ethdev.h>
 
 #include "common.h"
@@ -100,6 +101,7 @@ static inline uint64_t get_timestamp_ns(void) {
  * - BATCH_COLLECT_WINDOW_US: Time window to collect concurrent requests
  */
 #define BATCH_MAX_SIZE 8               /* Max concurrent batch size */
+static int g_fixed_batch = 0;          /* 0=adaptive (EWMA), >0=fixed batch size */
 
 /* Inference-Driven Adaptive Batching Parameters */
 #define EWMA_ALPHA             0.1    /* EWMA decay factor (~10 round memory) */
@@ -112,12 +114,13 @@ static inline uint64_t get_timestamp_ns(void) {
  * Collect PARAM_READY slots (non-blocking, using CAS atomic claim)
  * Returns the number of slots collected
  *
- * Uses memory barriers and boundary checks to handle concurrent GPU writes.
+ * Zero-copy optimization: URL-decodes directly on slot->data (slot is in
+ * PROCESSING state, CPU-owned) and returns pointers into the ring buffer.
+ * Eliminates the per-request memcpy to a stack buffer.
  */
 static int collect_ready_slots(struct inference_ring_buffer *ring,
                                uint32_t *batch_slots,
-                               char batch_data[][DATA_BUFFER_SIZE],
-                               uint32_t *batch_lens,
+                               const char **batch_texts,
                                int max_batch) {
 	if (__atomic_load_n(&ring->pending_count, __ATOMIC_ACQUIRE) == 0)
 		return 0;
@@ -156,14 +159,11 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 			continue;
 		}
 
+		slot->data[data_len] = '\0';
+		url_decode(slot->data);
+
 		batch_slots[count] = (uint32_t)idx;
-		batch_lens[count] = data_len;
-
-		uint32_t copy_len = (data_len < DATA_BUFFER_SIZE - 1) ? data_len : DATA_BUFFER_SIZE - 1;
-		memcpy(batch_data[count], slot->data, copy_len);
-		batch_data[count][copy_len] = '\0';
-
-		url_decode(batch_data[count]);
+		batch_texts[count] = slot->data;
 
 		slot->t3_cpu_read = get_timestamp_ns();
 
@@ -200,8 +200,6 @@ void* simple_inference_reader(void* arg) {
 	DOCA_LOG_INFO("[ADAPTIVE] Thread %d: Using GPU 0 for TensorRT", thread_id);
 
 	uint32_t batch_slots[BATCH_MAX_SIZE];
-	char batch_data[BATCH_MAX_SIZE][DATA_BUFFER_SIZE];
-	uint32_t batch_lens[BATCH_MAX_SIZE];
 	const char *batch_texts[BATCH_MAX_SIZE];
 	float batch_embeddings[BATCH_MAX_SIZE * MAX_EMBEDDING_DIM];
 	int batch_token_counts[BATCH_MAX_SIZE];
@@ -227,7 +225,7 @@ void* simple_inference_reader(void* arg) {
 		}
 
 		int batch_size = collect_ready_slots(g_inference_ring_buf, batch_slots,
-		                                      batch_data, batch_lens, BATCH_MAX_SIZE);
+		                                      batch_texts, BATCH_MAX_SIZE);
 
 		if (batch_size == 0) {
 			for (int spin = 0; spin < SPIN_ITERATIONS; spin++)
@@ -236,35 +234,46 @@ void* simple_inference_reader(void* arg) {
 			continue;
 		}
 
-		/* Adaptive dispatch: wait for more only if marginal saving > wait cost */
-		if (cal_count >= ADAPTIVE_COLD_ROUNDS
-		    && lambda_now > 0
-		    && c0_est > 0
-		    && batch_size < BATCH_MAX_SIZE) {
-
-			double save_us = c0_est / ((double)batch_size * (batch_size + 1));
-
-			while ((1.0 / lambda_now) <= save_us && batch_size < BATCH_MAX_SIZE) {
-				useconds_t wait = (useconds_t)(1.0 / lambda_now);
-				if (wait > ADAPTIVE_MAX_WAIT_US) wait = ADAPTIVE_MAX_WAIT_US;
-				if (wait < IDLE_SLEEP_US) wait = IDLE_SLEEP_US;
-				usleep(wait);
-
+		if (g_fixed_batch > 0) {
+			/* Fixed batch mode: wait until we have exactly g_fixed_batch requests */
+			int target = (g_fixed_batch > BATCH_MAX_SIZE) ? BATCH_MAX_SIZE : g_fixed_batch;
+			int wait_rounds = 0;
+			while (batch_size < target && wait_rounds < 1000) {
+				usleep(100);
 				int more = collect_ready_slots(g_inference_ring_buf,
 				                               &batch_slots[batch_size],
-				                               &batch_data[batch_size],
-				                               &batch_lens[batch_size],
-				                               BATCH_MAX_SIZE - batch_size);
-				if (more == 0)
-					break;
-				batch_size += more;
-				stat_waits++;
-				save_us = c0_est / ((double)batch_size * (batch_size + 1));
+				                               &batch_texts[batch_size],
+				                               target - batch_size);
+				if (more > 0) batch_size += more;
+				wait_rounds++;
+			}
+		} else {
+			/* Adaptive dispatch: wait for more only if marginal saving > wait cost */
+			if (cal_count >= ADAPTIVE_COLD_ROUNDS
+			    && lambda_now > 0
+			    && c0_est > 0
+			    && batch_size < BATCH_MAX_SIZE) {
+
+				double save_us = c0_est / ((double)batch_size * (batch_size + 1));
+
+				while ((1.0 / lambda_now) <= save_us && batch_size < BATCH_MAX_SIZE) {
+					useconds_t wait = (useconds_t)(1.0 / lambda_now);
+					if (wait > ADAPTIVE_MAX_WAIT_US) wait = ADAPTIVE_MAX_WAIT_US;
+					if (wait < IDLE_SLEEP_US) wait = IDLE_SLEEP_US;
+					usleep(wait);
+
+					int more = collect_ready_slots(g_inference_ring_buf,
+					                               &batch_slots[batch_size],
+					                               &batch_texts[batch_size],
+					                               BATCH_MAX_SIZE - batch_size);
+					if (more == 0)
+						break;
+					batch_size += more;
+					stat_waits++;
+					save_us = c0_est / ((double)batch_size * (batch_size + 1));
+				}
 			}
 		}
-
-		for (int i = 0; i < batch_size; i++)
-			batch_texts[i] = batch_data[i];
 
 		DOCA_LOG_INFO("[ADAPTIVE] dispatch batch=%d λ=%.0f/s c₀=%.0f c_m=%.0f cal=%d",
 		              batch_size, lambda_now * 1e6, c0_est, cm_est, cal_count);
@@ -316,15 +325,45 @@ void* simple_inference_reader(void* arg) {
 			cal_count++;
 
 			double var_n = ew_n2 - ew_n * ew_n;
+			if (var_n < 1e-6) var_n = 1e-6;
 			if (cal_count >= ADAPTIVE_COLD_ROUNDS && var_n > 0.01) {
 				cm_est = (ew_nt - ew_n * ew_t) / var_n;
 				c0_est = ew_t - cm_est * ew_n;
+				if (!isfinite(cm_est)) cm_est = ADAPTIVE_MIN_CM;
+				if (!isfinite(c0_est)) c0_est = ADAPTIVE_MIN_C0;
 				if (c0_est < ADAPTIVE_MIN_C0) c0_est = ADAPTIVE_MIN_C0;
 				if (cm_est < ADAPTIVE_MIN_CM) cm_est = ADAPTIVE_MIN_CM;
 			}
 
 			stat_batches++;
 			stat_requests += batch_size;
+
+			/* Per-stage timing accumulation for profiling */
+			{
+				static uint64_t sum_t3t4 = 0, sum_t4t5 = 0, sum_t5t6 = 0;
+				static uint64_t prof_count = 0;
+				uint64_t t6_now = get_timestamp_ns();
+				for (int i = 0; i < batch_size; i++) {
+					struct inference_ring_slot *s = &g_inference_ring_buf->slots[batch_slots[i]];
+					uint64_t dt34 = t4 - s->t3_cpu_read;
+					uint64_t dt45 = t5 - t4;
+					uint64_t dt56 = t6_now - t5;
+					sum_t3t4 += dt34;
+					sum_t4t5 += dt45;
+					sum_t5t6 += dt56;
+					prof_count++;
+				}
+				static uint64_t last_print = 0;
+				if (prof_count >= 100 && prof_count - last_print >= 5000) {
+					last_print = prof_count;
+					fprintf(stderr, "[PROFILE] n=%lu queue+tok=%.1fµs infer=%.1fµs result=%.1fµs total=%.1fµs\n",
+						(unsigned long)prof_count,
+						(double)sum_t3t4 / prof_count / 1000.0,
+						(double)sum_t4t5 / prof_count / 1000.0,
+						(double)sum_t5t6 / prof_count / 1000.0,
+						(double)(sum_t3t4 + sum_t4t5 + sum_t5t6) / prof_count / 1000.0);
+				}
+			}
 
 			DOCA_LOG_INFO("[ADAPTIVE] done batch=%d %ldµs (%.1f/req) arrived=%d λ=%.0f/s",
 			              batch_size, elapsed_us, (float)elapsed_us / batch_size,
@@ -337,7 +376,7 @@ void* simple_inference_reader(void* arg) {
 
 				snprintf(result_buffer, sizeof(result_buffer),
 					"{\"input\":\"%s\",\"tokens\":%d,\"embedding_sample\":[%.6f,%.6f,%.6f],\"inference_time_us\":%ld,\"batch_size\":%d}",
-					batch_data[i], tokens,
+					batch_texts[i], tokens,
 					emb[0], emb[1], emb[2],
 					elapsed_us, batch_size);
 
@@ -350,7 +389,7 @@ void* simple_inference_reader(void* arg) {
 			DOCA_LOG_WARN("[ADAPTIVE] TensorRT not loaded, fallback");
 			for (int i = 0; i < batch_size; i++) {
 				snprintf(result_buffer, sizeof(result_buffer),
-					"{\"input\":\"%.900s\",\"status\":\"no_model\"}", batch_data[i]);
+					"{\"input\":\"%.900s\",\"status\":\"no_model\"}", batch_texts[i]);
 				cpu_write_inference_result_to_gpu_ring(g_inference_ring_buf, batch_slots[i], result_buffer);
 			}
 		}
@@ -573,7 +612,13 @@ int main(int argc, char **argv)
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
-	g_cuda_id = cuda_id;  /* Save to global for other threads */
+	const char *fb_env = getenv("GAZSI_FIXED_BATCH");
+	if (fb_env) {
+		g_fixed_batch = atoi(fb_env);
+		DOCA_LOG_INFO("Fixed batch mode: batch=%d", g_fixed_batch);
+	}
+
+	g_cuda_id = cuda_id;
 	cudaFree(0);
 	cudaSetDevice(cuda_id);
 
@@ -610,7 +655,7 @@ int main(int argc, char **argv)
 
 		/* Warmup TensorRT to eliminate cold start latency */
 		DOCA_LOG_INFO("[WARMUP] Warming up TensorRT contexts...");
-		float temp_embeddings[1024];
+		float temp_embeddings[32768];
 		int temp_token_count;
 		#define WARMUP_ITERATIONS 10
 
@@ -740,6 +785,12 @@ int main(int argc, char **argv)
 	if (app_cfg.http_server)
 		cudaStreamSynchronize(tx_http_server);
 	DOCA_GPUNETIO_VOLATILE(*cpu_exit_condition) = 0;
+
+	/* CUPTI kernel profiling */
+	{
+		extern int cupti_profiler_init(void);
+		cupti_profiler_init();
+	}
 
 	/* Initialize UVM inference buffer */
 	if (app_cfg.http_server) {
@@ -903,6 +954,7 @@ int main(int argc, char **argv)
 	}
 
 	DOCA_GPUNETIO_VOLATILE(*cpu_exit_condition) = 1;
+
 	cudaStreamSynchronize(rx_tcp_stream);
 	cudaStreamDestroy(rx_tcp_stream);
 	if (app_cfg.http_server) {
@@ -911,6 +963,13 @@ int main(int argc, char **argv)
 	}
 
 	doca_gpu_mem_free(gpu_dev, gpu_exit_condition);
+
+	{
+		extern void cupti_profiler_dump(void);
+		extern void cupti_profiler_fini(void);
+		cupti_profiler_dump();
+		cupti_profiler_fini();
+	}
 
 	DOCA_LOG_INFO("GPU work ended");
 

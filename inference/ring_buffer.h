@@ -157,6 +157,10 @@ void free_inference_ring_buffer(struct inference_ring_buffer *ring);
 /* CPU-side write processing result to GPU ring. Returns 1 on success, 0 on failure */
 int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gpu, uint32_t slot_index, const char *result);
 
+/* Host-side slot data accessors (for cudaMemcpyAsync source) */
+const char *get_slot_data_host(uint32_t slot_index);
+uint32_t get_slot_len_host(uint32_t slot_index);
+
 /* GPU-side slot allocation. Returns slot index, -1 if ring buffer is full */
 #ifdef __CUDACC__
 __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t *request_id);

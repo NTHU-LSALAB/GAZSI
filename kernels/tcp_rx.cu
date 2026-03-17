@@ -25,17 +25,20 @@ extern __device__ struct doca_gpu_semaphore_gpu *g_sem_request_gpu;
 static
 __device__ enum http_page_get get_http_page_type(const uint8_t *payload)
 {
+	/* inference (hot path first) */
+	if (payload[5] == 'i' && payload[6] == 'n' && payload[7] == 'f' && payload[8] == 'e' &&
+	    payload[9] == 'r' && payload[10] == 'e' && payload[11] == 'n' && payload[12] == 'c' &&
+	    payload[13] == 'e' && (payload[14] == ' ' || payload[14] == '?'))
+		return HTTP_GET_INFERENCE;
 	/* index */
-	if (payload[5] == 'i' && payload[6] == 'n' && payload[7] == 'd' && payload[8] == 'e' && payload[9] == 'x' && payload[10] == '.')
+	if (payload[5] == 'i' && payload[6] == 'n' && payload[7] == 'd' && payload[8] == 'e' &&
+	    payload[9] == 'x' && payload[10] == '.')
 		return HTTP_GET_INDEX;
 	/* contacts */
-	if (payload[5] == 'c' && payload[6] == 'o' && payload[7] == 'n' && payload[8] == 't' && payload[9] == 'a' && payload[10] == 'c' && payload[11] == 't' && payload[12] == 's' && payload[13] == '.')
+	if (payload[5] == 'c' && payload[6] == 'o' && payload[7] == 'n' && payload[8] == 't' &&
+	    payload[9] == 'a' && payload[10] == 'c' && payload[11] == 't' && payload[12] == 's' &&
+	    payload[13] == '.')
 		return HTTP_GET_CONTACTS;
-	/* inference */
-	if (payload[5] == 'i' && payload[6] == 'n' && payload[7] == 'f' && payload[8] == 'e' && payload[9] == 'r' && payload[10] == 'e' && payload[11] == 'n' && payload[12] == 'c' && payload[13] == 'e' && 
-	    (payload[14] == ' ' || payload[14] == '?'))
-		return HTTP_GET_INFERENCE;
-	/* 404 not found */
 	return HTTP_GET_NOT_FOUND;
 }
 
@@ -186,11 +189,9 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 							uint32_t tcp_header_len = (hdr->l4_hdr.dt_off >> 4) * 4;
 							uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_header_len;
 
-							/* Initialize slot->len to prevent uninitialized value issues */
 							slot->len = 0;
 							slot->data[0] = '\0';
 
-							/* Extract parameter to slot->data */
 							for (int i = 5; i < (int)payload_len && i < 1024; i++) {
 								if (payload[i] == '?' && payload[i+1] == 'd' && payload[i+2] == '=') {
 									int param_start = i + 3;

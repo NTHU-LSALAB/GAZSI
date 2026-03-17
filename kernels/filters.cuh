@@ -45,7 +45,6 @@ filter_is_http(const uint8_t *pld)
 __device__ __inline__ int
 filter_is_http_get(const uint8_t *pld)
 {
-	/* GET / */
 	if (pld[0] != 'G')
 		return 0;
 	if (pld[1] == 'E' && pld[2] == 'T' && pld[3] == WHITESPACE_ASCII && pld[4] == '/')

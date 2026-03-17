@@ -254,13 +254,11 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
 
     struct inference_ring_slot *slot = &g_ring_host->slots[slot_index];
 
-    /* Write inference result data (Q3: fixed overflow — cap at sizeof(data)-1) */
     uint32_t max_len = sizeof(slot->data) - 1;
-    uint32_t len = 0;
-    while (result[len] != '\0' && len < max_len) {
-        slot->data[len] = result[len];
-        len++;
-    }
+    uint32_t len = (uint32_t)strlen(result);
+    if (len > max_len)
+        len = max_len;
+    memcpy(slot->data, result, len);
     slot->data[len] = '\0';
     slot->len = len;
 
@@ -277,6 +275,19 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
     }
 
     return 1;
+}
+
+/* Get host-side pointer to slot data (for cudaMemcpyAsync source) */
+const char *get_slot_data_host(uint32_t slot_index)
+{
+    if (slot_index >= INFERENCE_RING_SIZE || !g_ring_host) return NULL;
+    return g_ring_host->slots[slot_index].data;
+}
+
+uint32_t get_slot_len_host(uint32_t slot_index)
+{
+    if (slot_index >= INFERENCE_RING_SIZE || !g_ring_host) return 0;
+    return g_ring_host->slots[slot_index].len;
 }
 
 /* GPU-side function: allocate ring slot via O(1) free_pool pop */

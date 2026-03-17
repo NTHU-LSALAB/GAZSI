@@ -136,8 +136,8 @@ doca_error_t create_tcp_queues(struct rxq_tcp_queues *tcp_queues,
 		}
 
 		result = doca_mmap_set_permissions(tcp_queues->pkt_buff_mmap[idx],
-						   DOCA_ACCESS_FLAG_LOCAL_READ_WRITE |
-							   DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING);
+					   DOCA_ACCESS_FLAG_LOCAL_READ_WRITE |
+						   DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to set permissions for mmap %s", doca_error_get_descr(result));
 			destroy_tcp_queues(tcp_queues, http_server, http_queues);
