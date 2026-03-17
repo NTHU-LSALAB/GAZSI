@@ -53,15 +53,7 @@ app_srcs += files([
 app_srcs += files([
 	'inference/ring_buffer.cu',
 	'inference/tensorrt.cu',
-	'inference/cupti_profiler.c',
 ])
-
-# CUPTI profiling
-cupti_dep = declare_dependency(
-	compile_args : ['-I/usr/local/cuda-12.5/targets/x86_64-linux/include'],
-	link_args : ['-L/usr/local/cuda-12.5/targets/x86_64-linux/lib', '-lcupti']
-)
-app_dependencies += cupti_dep
 
 vanilla_app_srcs = [
 	'main.c',

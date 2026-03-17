@@ -786,12 +786,6 @@ int main(int argc, char **argv)
 		cudaStreamSynchronize(tx_http_server);
 	DOCA_GPUNETIO_VOLATILE(*cpu_exit_condition) = 0;
 
-	/* CUPTI kernel profiling */
-	{
-		extern int cupti_profiler_init(void);
-		cupti_profiler_init();
-	}
-
 	/* Initialize UVM inference buffer */
 	if (app_cfg.http_server) {
 		DOCA_LOG_INFO("Initializing UVM inference buffer");
@@ -963,13 +957,6 @@ int main(int argc, char **argv)
 	}
 
 	doca_gpu_mem_free(gpu_dev, gpu_exit_condition);
-
-	{
-		extern void cupti_profiler_dump(void);
-		extern void cupti_profiler_fini(void);
-		cupti_profiler_dump();
-		cupti_profiler_fini();
-	}
 
 	DOCA_LOG_INFO("GPU work ended");
 
