@@ -162,6 +162,9 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 		slot->data[data_len] = '\0';
 		url_decode(slot->data);
 
+		if (strlen(slot->data) > 512)
+			slot->data[512] = '\0';
+
 		batch_slots[count] = (uint32_t)idx;
 		batch_texts[count] = slot->data;
 
@@ -356,14 +359,22 @@ void* simple_inference_reader(void* arg) {
 					prof_count++;
 				}
 				static uint64_t last_print = 0;
+				static double baseline_infer_us = 0;
 				if (prof_count >= 100 && prof_count - last_print >= 5000) {
 					last_print = prof_count;
-					fprintf(stderr, "[PROFILE] n=%lu queue+tok=%.1fµs infer=%.1fµs result=%.1fµs total=%.1fµs\n",
+					double avg_infer = (double)sum_t4t5 / prof_count / 1000.0;
+					if (baseline_infer_us < 1.0)
+						baseline_infer_us = avg_infer;
+					double drift_pct = (avg_infer - baseline_infer_us) / baseline_infer_us * 100.0;
+					fprintf(stderr, "[PROFILE] n=%lu queue+tok=%.1fµs infer=%.1fµs result=%.1fµs total=%.1fµs drift=%.1f%%\n",
 						(unsigned long)prof_count,
 						(double)sum_t3t4 / prof_count / 1000.0,
-						(double)sum_t4t5 / prof_count / 1000.0,
+						avg_infer,
 						(double)sum_t5t6 / prof_count / 1000.0,
-						(double)(sum_t3t4 + sum_t4t5 + sum_t5t6) / prof_count / 1000.0);
+						(double)(sum_t3t4 + sum_t4t5 + sum_t5t6) / prof_count / 1000.0,
+						drift_pct);
+					if (drift_pct > 15.0)
+						fprintf(stderr, "[DRIFT] inference +%.0f%% from baseline\n", drift_pct);
 				}
 			}
 

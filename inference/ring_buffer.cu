@@ -136,7 +136,6 @@ struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
         return NULL;
     }
 
-    /* Get GPU-side pointer */
     if (cudaHostGetDevicePointer(&g_ring_device, g_ring_host, 0) != cudaSuccess) {
         cudaFreeHost(g_ring_host);
         return NULL;

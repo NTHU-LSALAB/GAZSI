@@ -154,14 +154,12 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 			/* Priority to GET for the HTTP server mode */
 			bool is_http_get = filter_is_http_get(payload);
 			if (is_http_get) {
-				/* Write directly to ring buffer, any thread can process */
 				if (http_server && g_inference_ring_buf != nullptr) {
-					/* Allocate ring buffer slot */
 					uint64_t request_id = 0;
 					int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
 
 					if (slot_idx >= 0) {
-							struct inference_ring_slot *slot = &g_inference_ring_buf->slots[slot_idx];
+						struct inference_ring_slot *slot = &g_inference_ring_buf->slots[slot_idx];
 
 							/* T0: HTTP request received */
 							slot->t0_gpu_received = clock64();

@@ -134,46 +134,45 @@ static int tokenize_text(const char* text,
     memset(input_ids, 0, SEQUENCE_LENGTH * sizeof(int64_t));
     memset(attention_mask, 0, SEQUENCE_LENGTH * sizeof(int64_t));
 
-    // [CLS] token at position 0
     input_ids[0] = 101;
     attention_mask[0] = 1;
 
     if (!text || text[0] == '\0') {
-        // Empty text: only [CLS] and [SEP]
         input_ids[1] = 102;
         attention_mask[1] = 1;
         return 2;
     }
 
-    // Simple word-based tokenization
-    std::string text_str(text);
-    std::istringstream iss(text_str);
-    std::string word;
     int token_pos = 1;
-    int actual_tokens = 1;
+    uint32_t hash = 0;
+    bool in_word = false;
 
-    while (std::getline(iss, word, ' ') && token_pos < SEQUENCE_LENGTH - 1) {
-        if (!word.empty()) {
-            // Hash-based token ID generation
-            uint32_t hash = 0;
-            for (char c : word) {
-                hash = hash * 31 + (uint8_t)c;
+    for (const char *p = text; *p && token_pos < SEQUENCE_LENGTH - 1; p++) {
+        if (*p == ' ') {
+            if (in_word) {
+                input_ids[token_pos] = 1000 + (hash % 20000);
+                attention_mask[token_pos] = 1;
+                token_pos++;
+                hash = 0;
+                in_word = false;
             }
-            input_ids[token_pos] = 1000 + (hash % 20000);
-            attention_mask[token_pos] = 1;
-            token_pos++;
-            actual_tokens++;
+        } else {
+            hash = hash * 31 + (uint8_t)*p;
+            in_word = true;
         }
     }
 
-    // [SEP] token
-    if (token_pos < SEQUENCE_LENGTH) {
-        input_ids[token_pos] = 102;
+    if (in_word && token_pos < SEQUENCE_LENGTH - 1) {
+        input_ids[token_pos] = 1000 + (hash % 20000);
         attention_mask[token_pos] = 1;
-        actual_tokens++;
+        token_pos++;
     }
 
-    return actual_tokens;
+    input_ids[token_pos] = 102;
+    attention_mask[token_pos] = 1;
+    token_pos++;
+
+    return token_pos;
 }
 
 // Wrapper struct to hold all TensorRT objects

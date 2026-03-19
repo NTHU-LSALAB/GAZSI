@@ -13,7 +13,6 @@
 /* Ring Buffer size - 128 performs better than 256 in testing */
 #define INFERENCE_RING_SIZE 128
 
-/* FIFO index queue capacity (must be power-of-2 and > INFERENCE_RING_SIZE) */
 #define IQ_CAPACITY 256
 #define IQ_MASK     (IQ_CAPACITY - 1)
 #define IQ_EMPTY    (-1)   /* Sentinel: slot entry not yet written */
