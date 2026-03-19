@@ -12,17 +12,12 @@ build/
 *.exe
 
 # -----------------------------------------------------------------------------
-# Model files (too large for GitHub, download separately)
+# Data directories (not source code)
 # -----------------------------------------------------------------------------
-models/*.onnx
-models/*.engine
-models/*.plan
-models/*_onnx/
-models/m.*
-models/m.layers.*
-models/onnx__*
-models/Constant_*
-models/tinyllama_onnx/
+models/
+baseline/
+benchmark_results/
+docs/
 
 # -----------------------------------------------------------------------------
 # Python
