@@ -18,6 +18,7 @@ models/
 baseline/
 benchmark_results/
 docs/
+tools/
 
 # -----------------------------------------------------------------------------
 # Python
