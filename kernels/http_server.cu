@@ -278,16 +278,14 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 				}
 
 				raw_to_tcp(buf_addr, &hdr, &payload);
-				/* Read TCP connection info from slot */
-				http_set_mac_addr(hdr, (uint16_t *)current_slot->eth_dst_addr_bytes, (uint16_t *)current_slot->eth_src_addr_bytes);
-				hdr->l3_hdr.src_addr = current_slot->ip_dst_addr;
-				hdr->l3_hdr.dst_addr = current_slot->ip_src_addr;
-				hdr->l4_hdr.src_port = current_slot->tcp_dst_port;
-				hdr->l4_hdr.dst_port = current_slot->tcp_src_port;
-				hdr->l4_hdr.sent_seq = current_slot->tcp_recv_ack;
-				/* TCP sequence calculation: client_seq + client_data_len */
-				uint32_t client_data_len = BYTE_SWAP16(current_slot->ip_total_length) - sizeof(struct ipv4_hdr) - ((current_slot->tcp_dt_off >> 4) * 4);
-				hdr->l4_hdr.recv_ack = BYTE_SWAP32(BYTE_SWAP32(current_slot->tcp_sent_seq) + client_data_len);
+				/* Direct copy: RX kernel already pre-swapped src↔dst */
+				http_set_mac_addr(hdr, (uint16_t *)current_slot->eth_src_addr_bytes, (uint16_t *)current_slot->eth_dst_addr_bytes);
+				hdr->l3_hdr.src_addr = current_slot->ip_src_addr;
+				hdr->l3_hdr.dst_addr = current_slot->ip_dst_addr;
+				hdr->l4_hdr.src_port = current_slot->tcp_src_port;
+				hdr->l4_hdr.dst_port = current_slot->tcp_dst_port;
+				hdr->l4_hdr.sent_seq = current_slot->tcp_sent_seq;
+				hdr->l4_hdr.recv_ack = current_slot->tcp_recv_ack;
 				
 				/* Keep-Alive: ACK + PSH without FIN */
 				hdr->l4_hdr.tcp_flags = TCP_FLAG_ACK | TCP_FLAG_PSH;

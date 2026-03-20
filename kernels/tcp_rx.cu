@@ -159,21 +159,24 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 							/* T0: HTTP request received */
 							slot->t0_gpu_received = clock64();
 
-							/* Copy TCP connection info to slot */
-							((uint16_t *)slot->eth_src_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[0];
-							((uint16_t *)slot->eth_src_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[1];
-							((uint16_t *)slot->eth_src_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[2];
-							((uint16_t *)slot->eth_dst_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[0];
-							((uint16_t *)slot->eth_dst_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[1];
-							((uint16_t *)slot->eth_dst_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[2];
-							slot->ip_src_addr = hdr->l3_hdr.src_addr;
-							slot->ip_dst_addr = hdr->l3_hdr.dst_addr;
+							/* Pre-swap TCP info: store as response-ready (src↔dst swapped) */
+							((uint16_t *)slot->eth_src_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[0];
+							((uint16_t *)slot->eth_src_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[1];
+							((uint16_t *)slot->eth_src_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[2];
+							((uint16_t *)slot->eth_dst_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[0];
+							((uint16_t *)slot->eth_dst_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[1];
+							((uint16_t *)slot->eth_dst_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[2];
+							slot->ip_src_addr = hdr->l3_hdr.dst_addr;
+							slot->ip_dst_addr = hdr->l3_hdr.src_addr;
 							slot->ip_total_length = hdr->l3_hdr.total_length;
-							slot->tcp_src_port = hdr->l4_hdr.src_port;
-							slot->tcp_dst_port = hdr->l4_hdr.dst_port;
+							slot->tcp_src_port = hdr->l4_hdr.dst_port;
+							slot->tcp_dst_port = hdr->l4_hdr.src_port;
 							slot->tcp_dt_off = hdr->l4_hdr.dt_off;
-							slot->tcp_sent_seq = hdr->l4_hdr.sent_seq;
-							slot->tcp_recv_ack = hdr->l4_hdr.recv_ack;
+
+							uint32_t client_data_len = BYTE_SWAP16(hdr->l3_hdr.total_length)
+							                         - sizeof(struct ipv4_hdr) - ((hdr->l4_hdr.dt_off >> 4) * 4);
+							slot->tcp_sent_seq = hdr->l4_hdr.recv_ack;
+							slot->tcp_recv_ack = BYTE_SWAP32(BYTE_SWAP32(hdr->l4_hdr.sent_seq) + client_data_len);
 
 							slot->http_page_type = (uint8_t)get_http_page_type(payload);
 

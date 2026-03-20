@@ -48,12 +48,17 @@ __device__ int gpu_iq_pop(struct index_queue *q)
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
         tail_ref(*(uint32_t *)&q->tail);
 
+    static __shared__ uint32_t cached_tail;
     uint32_t h, t;
     for (;;) {
         h = head_ref.load(cuda::memory_order_acquire);
-        t = tail_ref.load(cuda::memory_order_acquire);
-        if (h >= t)
-            return -1;
+        t = cached_tail;
+        if (h >= t) {
+            t = tail_ref.load(cuda::memory_order_acquire);
+            cached_tail = t;
+            if (h >= t)
+                return -1;
+        }
         if (head_ref.compare_exchange_weak(h, h + 1,
                 cuda::memory_order_acq_rel, cuda::memory_order_relaxed))
             break;
