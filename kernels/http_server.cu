@@ -245,40 +245,24 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 				if (page_type == HTTP_GET_INFERENCE) {
 					char *response_buf = (char *)(buf_addr + base_pkt_len);
 
-					/* Zero-Copy Response Construction */
 					int body_len = 0;
 					int header_len = 0;
-					bool result_ready = false;
-					uint64_t request_id = current_slot->request_id;
 
-					/* Result already in current_slot->data */
-					if (lane_id == 0 && slot_idx >= 0) {
-						result_ready = true;
-						char *body_start = response_buf + HTTP_BODY_TEMP_OFFSET;
-						body_len = strcpy_to_buf(body_start, current_slot->data, HTTP_BODY_MAX_LEN);
-						body_start[body_len] = '\0';
-						current_slot->t8_gpu_sent = clock64();
-						(void)request_id;
-					}
-
-					result_ready = __shfl_sync(0xffffffff, result_ready, 0);
-
-					/* Lane 0 constructs HTTP response */
 					if (lane_id == 0) {
-						if (!result_ready) {
-							const char *error_msg =
-								"{\r\n"
-								"  \"status\": \"error\",\r\n"
-								"  \"message\": \"Ring buffer full or timeout\"\r\n"
-								"}\r\n";
-							char *body_start = response_buf + HTTP_BODY_TEMP_OFFSET;
-							body_len = strcpy_to_buf(body_start, error_msg, HTTP_BODY_MAX_LEN);
-							body_start[body_len] = '\0';
-						}
+						current_slot->t8_gpu_sent = clock64();
 
-						/* Content-Length is the only variable part; compute it first */
 						header_len = HTTP_RESP_PREFIX_LEN;
-						header_len += int_to_str(response_buf + header_len, body_len);
+						body_len = (int)current_slot->len;
+						if (body_len <= 0 || body_len > HTTP_BODY_MAX_LEN) {
+							const char err[] = "{\"error\":\"no result\"}";
+							body_len = sizeof(err) - 1;
+							header_len += int_to_str(response_buf + header_len, body_len);
+							int body_off = header_len + HTTP_RESP_SUFFIX_LEN;
+							for (int k = 0; k < body_len; k++)
+								response_buf[body_off + k] = err[k];
+						} else {
+							header_len += int_to_str(response_buf + header_len, body_len);
+						}
 						nbytes_page = header_len + HTTP_RESP_SUFFIX_LEN + body_len;
 					}
 
@@ -286,12 +270,11 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 					body_len = __shfl_sync(0xffffffff, body_len, 0);
 					nbytes_page = __shfl_sync(0xffffffff, nbytes_page, 0);
 
-					/* Warp-parallel: prefix, suffix, and body copy */
 					warp_memcpy(response_buf, HTTP_RESP_PREFIX, HTTP_RESP_PREFIX_LEN, lane_id);
 					__syncwarp();
 					warp_memcpy(response_buf + header_len, HTTP_RESP_SUFFIX, HTTP_RESP_SUFFIX_LEN, lane_id);
-					char *body_src = response_buf + HTTP_BODY_TEMP_OFFSET;
-					warp_memcpy(response_buf + header_len + HTTP_RESP_SUFFIX_LEN, body_src, body_len, lane_id);
+					int body_off = header_len + HTTP_RESP_SUFFIX_LEN;
+					warp_memcpy(response_buf + body_off, current_slot->data, body_len, lane_id);
 				}
 
 				raw_to_tcp(buf_addr, &hdr, &payload);

@@ -69,13 +69,8 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 	uint32_t max_pkts;
 	uint64_t timeout_ns;
 
-	if (http_server) {
-		max_pkts = MAX_RX_NUM_PKTS_HTTP;
-		timeout_ns = MAX_RX_TIMEOUT_NS_HTTP;
-	} else {
-		max_pkts = MAX_RX_NUM_PKTS_HTTP;
-		timeout_ns = MAX_RX_TIMEOUT_NS_HTTP;
-	}
+	max_pkts = MAX_RX_NUM_PKTS_HTTP;
+	timeout_ns = MAX_RX_TIMEOUT_NS_HTTP;
 
 	if (blockIdx.x == 0) {
 		rxq = rxq0;
@@ -190,21 +185,45 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 							slot->len = 0;
 							slot->data[0] = '\0';
 
-							for (int i = 5; i < (int)payload_len && i < 1024; i++) {
-								if (payload[i] == '?' && payload[i+1] == 'd' && payload[i+2] == '=') {
-									int param_start = i + 3;
-									int param_len = 0;
-									int max_search = payload_len < (uint32_t)(param_start + 511) ? payload_len : (param_start + 511);
-
-									for (int j = param_start; j < max_search; j++) {
-										if (payload[j] == ' ' || payload[j] == '&' ||
-										    payload[j] == '\r' || payload[j] == '\n') break;
-										slot->data[param_len++] = payload[j];
+							/* Fast path: /inference?d= has "?d=" at known offset */
+							int param_start = -1;
+							if (payload_len > 18 &&
+							    payload[15] == '?' && payload[16] == 'd' && payload[17] == '=') {
+								param_start = 18;
+							} else {
+								for (int i = 5; i < (int)payload_len && i < 1024; i++) {
+									if (payload[i] == '?' && payload[i+1] == 'd' && payload[i+2] == '=') {
+										param_start = i + 3;
+										break;
 									}
-									slot->data[param_len] = '\0';
-									slot->len = param_len;
-									break;
 								}
+							}
+
+							if (param_start >= 0) {
+								int param_len = 0;
+								int max_search = payload_len < (uint32_t)(param_start + 511) ? payload_len : (param_start + 511);
+								for (int j = param_start; j < max_search; j++) {
+									uint8_t c = payload[j];
+									if (c == ' ' || c == '&' || c == '\r' || c == '\n')
+										break;
+									if (c == '+') {
+										slot->data[param_len++] = ' ';
+									} else if (c == '%' && j + 2 < max_search) {
+										uint8_t hi = payload[j+1], lo = payload[j+2];
+										uint8_t h = (hi >= '0' && hi <= '9') ? hi - '0' :
+										            (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 :
+										            (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : 0;
+										uint8_t l = (lo >= '0' && lo <= '9') ? lo - '0' :
+										            (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 :
+										            (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : 0;
+										slot->data[param_len++] = (char)((h << 4) | l);
+										j += 2;
+									} else {
+										slot->data[param_len++] = (char)c;
+									}
+								}
+								slot->data[param_len] = '\0';
+								slot->len = param_len;
 							}
 
 					/* Only set PARAM_READY if valid parameter was extracted */

@@ -118,6 +118,10 @@ static int g_fixed_batch = 0;          /* 0=adaptive (EWMA), >0=fixed batch size
  * PROCESSING state, CPU-owned) and returns pointers into the ring buffer.
  * Eliminates the per-request memcpy to a stack buffer.
  */
+static int g_use_scan = 0;
+static uint64_t g_collect_time_sum = 0;
+static uint64_t g_collect_count = 0;
+
 static int collect_ready_slots(struct inference_ring_buffer *ring,
                                uint32_t *batch_slots,
                                const char **batch_texts,
@@ -125,9 +129,41 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 	if (__atomic_load_n(&ring->pending_count, __ATOMIC_ACQUIRE) == 0)
 		return 0;
 
+	uint64_t t_start = get_timestamp_ns();
 	int count = 0;
 
-	/* Q2: O(1) pop from request_queue instead of O(N) scan */
+	if (g_use_scan) {
+		while (cpu_iq_pop(&ring->request_queue) >= 0) ;
+
+		for (int i = 0; i < INFERENCE_RING_SIZE && count < max_batch; i++) {
+			uint32_t expected = UVM_STATUS_PARAM_READY;
+			if (__atomic_compare_exchange_n(&ring->slots[i].ready,
+			                                &expected, UVM_STATUS_PROCESSING,
+			                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+				__atomic_fetch_sub(&ring->pending_count, 1, __ATOMIC_RELEASE);
+				int idx = i;
+				struct inference_ring_slot *slot = &ring->slots[idx];
+				uint32_t data_len = slot->len;
+				if (data_len > MAX_DATA_LEN) {
+					__atomic_store_n(&slot->ready, UVM_STATUS_FREE, __ATOMIC_RELEASE);
+					cpu_iq_push(&ring->free_pool, idx);
+					continue;
+				}
+				slot->data[data_len] = '\0';
+				url_decode(slot->data);
+				if (strlen(slot->data) > 512) slot->data[512] = '\0';
+				batch_slots[count] = (uint32_t)idx;
+				batch_texts[count] = slot->data;
+				slot->t3_cpu_read = get_timestamp_ns();
+				count++;
+			}
+		}
+		uint64_t elapsed = get_timestamp_ns() - t_start;
+		g_collect_time_sum += elapsed;
+		g_collect_count++;
+		return count;
+	}
+
 	while (count < max_batch) {
 		int idx = cpu_iq_pop(&ring->request_queue);
 		if (idx < 0)
@@ -149,7 +185,6 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 		}
 
 		__atomic_fetch_sub(&ring->pending_count, 1, __ATOMIC_RELEASE);
-		__sync_synchronize();
 
 		uint32_t data_len = slot->len;
 		if (data_len > MAX_DATA_LEN) {
@@ -160,9 +195,8 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 		}
 
 		slot->data[data_len] = '\0';
-		url_decode(slot->data);
 
-		if (strlen(slot->data) > 512)
+		if (data_len > 512)
 			slot->data[512] = '\0';
 
 		batch_slots[count] = (uint32_t)idx;
@@ -173,6 +207,9 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 		count++;
 	}
 
+	uint64_t elapsed = get_timestamp_ns() - t_start;
+	g_collect_time_sum += elapsed;
+	g_collect_count++;
 	return count;
 }
 
@@ -199,8 +236,8 @@ void* simple_inference_reader(void* arg) {
 	DOCA_LOG_INFO("[ADAPTIVE] Inference reader thread %d started (max_batch=%d)",
 	              thread_id, BATCH_MAX_SIZE);
 
-	cudaSetDevice(0);
-	DOCA_LOG_INFO("[ADAPTIVE] Thread %d: Using GPU 0 for TensorRT", thread_id);
+	cudaSetDevice(g_cuda_id);
+	DOCA_LOG_INFO("[ADAPTIVE] Thread %d: Using GPU %d for TensorRT", thread_id, g_cuda_id);
 
 	uint32_t batch_slots[BATCH_MAX_SIZE];
 	const char *batch_texts[BATCH_MAX_SIZE];
@@ -231,9 +268,12 @@ void* simple_inference_reader(void* arg) {
 		                                      batch_texts, BATCH_MAX_SIZE);
 
 		if (batch_size == 0) {
-			for (int spin = 0; spin < SPIN_ITERATIONS; spin++)
+			for (int spin = 0; spin < 2000; spin++) {
+				if (__atomic_load_n(&g_inference_ring_buf->pending_count,
+				                    __ATOMIC_ACQUIRE) > 0)
+					break;
 				__asm__ __volatile__("pause" ::: "memory");
-			usleep(IDLE_SLEEP_US);
+			}
 			continue;
 		}
 
@@ -375,6 +415,11 @@ void* simple_inference_reader(void* arg) {
 						drift_pct);
 					if (drift_pct > 15.0)
 						fprintf(stderr, "[DRIFT] inference +%.0f%% from baseline\n", drift_pct);
+					if (g_collect_count > 0)
+						fprintf(stderr, "[COLLECT] mode=%s avg=%.1fns count=%lu\n",
+							g_use_scan ? "O(N)-scan" : "O(1)-FIFO",
+							(double)g_collect_time_sum / g_collect_count,
+							(unsigned long)g_collect_count);
 				}
 			}
 
@@ -629,6 +674,10 @@ int main(int argc, char **argv)
 	if (fb_env) {
 		g_fixed_batch = atoi(fb_env);
 		DOCA_LOG_INFO("Fixed batch mode: batch=%d", g_fixed_batch);
+	}
+	if (getenv("GAZSI_USE_SCAN")) {
+		g_use_scan = 1;
+		DOCA_LOG_INFO("Using O(N) scan instead of O(1) FIFO");
 	}
 
 	g_cuda_id = cuda_id;
