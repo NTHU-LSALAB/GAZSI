@@ -72,24 +72,6 @@ void batch_tokenize_and_infer(TensorRT_Model_t* model, const char** texts, int b
  */
 int init_cuda_graphs(TensorRT_Model_t* model);
 
-/**
- * @brief GPU-tokenized batch inference: tokenization on GPU, no H2D copy.
- *
- * Reads text directly from ring buffer slots (GPU-mapped host memory),
- * tokenizes on GPU, runs TRT inference, returns results.
- *
- * @param model     TensorRT model handle
- * @param ring      Ring buffer (device pointer from init_inference_ring_buffer)
- * @param batch_slots  Array of slot indices to process
- * @param batch_size   Number of items (1-8)
- * @param batch_embeddings  Output embeddings (caller allocates)
- * @param token_counts      Output token counts (caller allocates)
- */
-void batch_gpu_tokenize_and_infer(TensorRT_Model_t* model,
-    struct inference_ring_buffer *ring,
-    unsigned int *batch_slots, int batch_size,
-    float* batch_embeddings, int* token_counts);
-
 #ifdef __cplusplus
 }
 #endif

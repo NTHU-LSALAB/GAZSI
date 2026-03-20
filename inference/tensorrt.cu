@@ -615,77 +615,6 @@ extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
     return 0;
 }
 
-/*
- * GPU Tokenization Kernel — identical hash-based tokenizer running on GPU.
- * Reads text from ring buffer slots (cudaHostAllocMapped, GPU reads via PCIe).
- * Writes token IDs directly to TRT device buffers (no H2D copy needed).
- *
- * One block per batch item, single thread per block (text parsing is sequential).
- */
-__global__ void gpu_tokenize_batch_kernel(
-    const char *d_texts,
-    int text_stride,
-    int64_t *d_input_ids,
-    int64_t *d_attention_mask,
-    int *d_token_counts,
-    int batch_size,
-    int seq_len)
-{
-    int b = blockIdx.x;
-    if (b >= batch_size) return;
-    if (threadIdx.x != 0) return;
-
-    int64_t *input_ids = &d_input_ids[b * seq_len];
-    int64_t *attention_mask = &d_attention_mask[b * seq_len];
-    const char *text = &d_texts[b * text_stride];
-
-    for (int i = 0; i < seq_len; i++) {
-        input_ids[i] = 0;
-        attention_mask[i] = 0;
-    }
-
-    input_ids[0] = 101;
-    attention_mask[0] = 1;
-
-    int token_pos = 1;
-    uint32_t hash = 0;
-    bool in_word = false;
-
-    for (int i = 0; i < text_stride - 1 && text[i] != '\0' && token_pos < seq_len - 1; i++) {
-        if (text[i] == ' ') {
-            if (in_word) {
-                input_ids[token_pos] = 1000 + (hash % 20000);
-                attention_mask[token_pos] = 1;
-                token_pos++;
-                hash = 0;
-                in_word = false;
-            }
-        } else {
-            hash = hash * 31 + (uint8_t)text[i];
-            in_word = true;
-        }
-    }
-
-    if (in_word && token_pos < seq_len - 1) {
-        input_ids[token_pos] = 1000 + (hash % 20000);
-        attention_mask[token_pos] = 1;
-        token_pos++;
-    }
-
-    input_ids[token_pos] = 102;
-    attention_mask[token_pos] = 1;
-    token_pos++;
-
-    d_token_counts[b] = token_pos;
-}
-
-static int *d_token_counts_gpu = nullptr;
-static char *d_text_staging = nullptr;
-static int64_t *d_gpu_tok_input_ids = nullptr;
-static int64_t *d_gpu_tok_attention_mask = nullptr;
-static cudaStream_t gpu_tok_stream = nullptr;
-#define TEXT_SLOT_SIZE 856
-
 // Batch Tokenization: Convert N texts to batch tensor (CPU path, kept as fallback)
 static void batch_tokenize(const char** texts, int batch_size,
                             int64_t* batch_input_ids, int64_t* batch_attention_mask,
@@ -769,8 +698,8 @@ extern "C" void batch_tokenize_and_infer(TensorRT_Model_t* model_ptr, const char
                 context->setInputShape("token_type_ids", input_dims);
             }
 
-        context->setTensorAddress("input_ids", d_gpu_tok_input_ids);
-        context->setTensorAddress("attention_mask", d_gpu_tok_attention_mask);
+            context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
+            context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
             if (model->has_token_type_ids) {
                 context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
             }
@@ -801,9 +730,12 @@ extern "C" void batch_tokenize_and_infer(TensorRT_Model_t* model_ptr, const char
             cudaEventElapsedTime(&gpu_ms, ev_infer_start, ev_infer_end);
             sum_gpu_infer_ms += gpu_ms;
             gpu_infer_count++;
-            if (gpu_infer_count > 0 && gpu_infer_count % 2000 == 0)
-                fprintf(stderr, "[GPU_INFER] n=%lu avg=%.3fms/batch batch_items=%d\n",
+            if (gpu_infer_count > 0 && gpu_infer_count % 2000 == 0) {
+                fprintf(stderr, "[GPU_INFER] window=%lu avg=%.3fms/batch batch_items=%d\n",
                     (unsigned long)gpu_infer_count, sum_gpu_infer_ms / gpu_infer_count, batch_size);
+                sum_gpu_infer_ms = 0;
+                gpu_infer_count = 0;
+            }
         }
 
         int edim = model->embedding_dim;
@@ -824,159 +756,4 @@ extern "C" void batch_tokenize_and_infer(TensorRT_Model_t* model_ptr, const char
     }
 }
 
-/*
- * GPU-tokenized batch inference: tokenization runs on GPU, reading directly
- * from ring buffer slots. Eliminates CPU tokenization + H2D copy.
- *
- * Data path: ring slot (host-mapped) → GPU tokenize kernel → d_input_ids (GPU)
- *            → TRT inference → d_output (GPU) → D2H → host output
- */
-extern "C" void batch_gpu_tokenize_and_infer(
-    TensorRT_Model_t* model_ptr,
-    struct inference_ring_buffer *ring,
-    uint32_t *batch_slots,
-    int batch_size,
-    float* batch_embeddings,
-    int* token_counts)
-{
-    auto* model = static_cast<TensorRT_Context*>(model_ptr);
 
-    if (!model || !ring || !batch_slots || !batch_embeddings || !token_counts)
-        return;
-    if (batch_size < 1 || batch_size > MAX_BATCH_SIZE)
-        return;
-
-    init_batch_buffers();
-    if (!g_batch_buffers.initialized) return;
-
-    /* Use context 1 to avoid state conflicts with CUDA Graphs (captured on context 0) */
-    if (model->contexts.size() < 2 || !model->contexts[1]) return;
-
-    if (!d_token_counts_gpu)
-        cudaMalloc(&d_token_counts_gpu, MAX_BATCH_SIZE * sizeof(int));
-    if (!d_text_staging)
-        cudaMalloc(&d_text_staging, MAX_BATCH_SIZE * TEXT_SLOT_SIZE);
-    size_t tok_buf_size = MAX_BATCH_SIZE * SEQUENCE_LENGTH * sizeof(int64_t);
-    if (!d_gpu_tok_input_ids) {
-        cudaMalloc(&d_gpu_tok_input_ids, tok_buf_size);
-        cudaMalloc(&d_gpu_tok_attention_mask, tok_buf_size);
-        cudaMemset(d_gpu_tok_input_ids, 0, tok_buf_size);
-        cudaMemset(d_gpu_tok_attention_mask, 0, tok_buf_size);
-    }
-
-    try {
-        auto* context = model->contexts[1].get();
-        if (!gpu_tok_stream)
-            cudaStreamCreate(&gpu_tok_stream);
-        cudaStream_t stream = gpu_tok_stream;
-
-        for (int i = 0; i < batch_size; i++) {
-            const char *host_data = get_slot_data_host(batch_slots[i]);
-            uint32_t len = get_slot_len_host(batch_slots[i]);
-            if (len >= TEXT_SLOT_SIZE) len = TEXT_SLOT_SIZE - 1;
-            fprintf(stderr, "[GPU_TOK] slot=%u len=%u data=%.20s\n",
-                    batch_slots[i], len, host_data ? host_data : "(null)");
-            CUDA_CHECK(cudaMemcpyAsync(
-                d_text_staging + i * TEXT_SLOT_SIZE,
-                host_data, len + 1,
-                cudaMemcpyHostToDevice, stream));
-        }
-
-        /* Test if ANY GPU operation completes on this stream */
-        CUDA_CHECK(cudaMemsetAsync(d_text_staging, 0, 1, stream));
-        cudaError_t test_err = cudaStreamSynchronize(stream);
-        fprintf(stderr, "[GPU_TOK] memset test: %s\n",
-                test_err == cudaSuccess ? "OK" : cudaGetErrorString(test_err));
-
-        fprintf(stderr, "[GPU_TOK] H2D done, testing trivial kernel...\n");
-
-        /* Trivial kernel test: does ANY kernel complete? */
-        cudaMemsetAsync(d_gpu_tok_input_ids, 0, 8, stream);
-        cudaError_t trivial_err = cudaStreamSynchronize(stream);
-        fprintf(stderr, "[GPU_TOK] trivial memset+sync: %s\n",
-                trivial_err == cudaSuccess ? "OK" : cudaGetErrorString(trivial_err));
-
-        fprintf(stderr, "[GPU_TOK] launching tokenize kernel bs=%d...\n", batch_size);
-        gpu_tokenize_batch_kernel<<<batch_size, 1, 0, stream>>>(
-            d_text_staging, TEXT_SLOT_SIZE,
-            d_gpu_tok_input_ids,
-            d_gpu_tok_attention_mask,
-            d_token_counts_gpu,
-            batch_size, SEQUENCE_LENGTH);
-
-        cudaError_t launch_err = cudaGetLastError();
-        if (launch_err != cudaSuccess) {
-            fprintf(stderr, "[GPU_TOK] Kernel launch failed: %s\n",
-                    cudaGetErrorString(launch_err));
-            return;
-        }
-
-        fprintf(stderr, "[GPU_TOK] kernel launched, syncing...\n");
-        cudaError_t sync_err = cudaStreamSynchronize(stream);
-        if (sync_err != cudaSuccess)
-            fprintf(stderr, "[GPU_TOK] sync failed: %s\n", cudaGetErrorString(sync_err));
-        else
-            fprintf(stderr, "[GPU_TOK] sync done!\n");
-
-        /* TRT inference — no H2D copy needed, data already on GPU */
-        size_t output_size = model->output_has_seq_dim
-            ? batch_size * SEQUENCE_LENGTH * model->embedding_dim * sizeof(float)
-            : batch_size * model->embedding_dim * sizeof(float);
-
-        nvinfer1::Dims input_dims;
-        input_dims.nbDims = 2;
-        input_dims.d[0] = batch_size;
-        input_dims.d[1] = SEQUENCE_LENGTH;
-
-        context->setInputShape("input_ids", input_dims);
-        context->setInputShape("attention_mask", input_dims);
-        if (model->has_token_type_ids)
-            context->setInputShape("token_type_ids", input_dims);
-
-        context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
-        context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
-        if (model->has_token_type_ids)
-            context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
-        if (model->has_position_ids) {
-            g_batch_buffers.h_position_ids[0] = (int64_t)SEQUENCE_LENGTH;
-            CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_position_ids,
-                                        g_batch_buffers.h_position_ids,
-                                        sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-            context->setTensorAddress(model->position_ids_name.c_str(),
-                                       g_batch_buffers.d_position_ids);
-        }
-        context->setTensorAddress(model->output_tensor_name.c_str(), g_batch_buffers.d_output);
-        if (model->has_pooler_output && !model->pooler_tensor_name.empty())
-            context->setTensorAddress(model->pooler_tensor_name.c_str(),
-                                       g_batch_buffers.d_pooler_output);
-
-        if (!context->enqueueV3(stream)) {
-            fprintf(stderr, "[GPU_TOK] Error: enqueueV3 failed\n");
-            return;
-        }
-        CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.h_output, g_batch_buffers.d_output,
-                                    output_size, cudaMemcpyDeviceToHost, stream));
-
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        /* Copy token counts from GPU after sync (non-pinned dest requires sync first) */
-        CUDA_CHECK(cudaMemcpy(token_counts, d_token_counts_gpu,
-                               batch_size * sizeof(int), cudaMemcpyDeviceToHost));
-
-        int edim = model->embedding_dim;
-        int stride = model->output_has_seq_dim ? SEQUENCE_LENGTH * edim : edim;
-        for (int b = 0; b < batch_size; b++) {
-            float* src = &g_batch_buffers.h_output[b * stride];
-            float* dst = &batch_embeddings[b * edim];
-            memcpy(dst, src, edim * sizeof(float));
-        }
-
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[GPU_TOK] Exception: %s\n", e.what());
-        int edim = model->embedding_dim;
-        for (int b = 0; b < batch_size; b++) {
-            token_counts[b] = 0;
-            memset(&batch_embeddings[b * edim], 0, edim * sizeof(float));
-        }
-    }
-}

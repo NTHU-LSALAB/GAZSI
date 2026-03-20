@@ -261,7 +261,6 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
     slot->data[len] = '\0';
     slot->len = len;
 
-    __sync_synchronize();
     __atomic_store_n(&slot->ready, UVM_STATUS_RESULT_READY, __ATOMIC_RELEASE);
 
     /* Push to response_queue so GPU TX can find it in O(1) */

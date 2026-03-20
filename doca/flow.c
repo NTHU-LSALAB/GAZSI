@@ -732,6 +732,9 @@ doca_error_t disable_tcp_gpu_offload(struct doca_flow_port *port,
 			      htons(session_entry->key.dst_port));
 	}
 
+	/* Flush the removal — ensure flow entry is fully deleted in HW */
+	doca_flow_entries_process(port, queue_id, default_flow_timeout_usec, 0);
+
 	return result;
 }
 

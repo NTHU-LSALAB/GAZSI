@@ -146,6 +146,7 @@ doca_error_t create_tcp_session(const uint16_t queue_id,
 				struct doca_flow_pipe *gpu_rss_pipe)
 {
 	int ret;
+	doca_error_t result;
 	struct tcp_session_entry *session_entry;
 
 	session_entry = rte_zmalloc("tcp_session", sizeof(struct tcp_session_entry), 0);
@@ -154,11 +155,16 @@ doca_error_t create_tcp_session(const uint16_t queue_id,
 		return DOCA_ERROR_NO_MEMORY;
 	}
 	session_entry->key = extract_session_key(pkt);
-	enable_tcp_gpu_offload(port, queue_id, gpu_rss_pipe, session_entry);
+	result = enable_tcp_gpu_offload(port, queue_id, gpu_rss_pipe, session_entry);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create GPU offload flow, freeing session");
+		rte_free(session_entry);
+		return result;
+	}
 
 	ret = rte_hash_add_key_data(tcp_session_table, &session_entry->key, session_entry);
 	if (ret != 0) {
-		DOCA_LOG_ERR("Couldn't add new has key data err %d", ret);
+		DOCA_LOG_ERR("Couldn't add new hash key data err %d", ret);
 		return DOCA_ERROR_DRIVER;
 	}
 
