@@ -20,9 +20,8 @@
 /* Buffer and inference constants */
 #define DATA_BUFFER_SIZE     1024    /* Max size for inference data buffer */
 #define MAX_EMBEDDING_DIM    4096    /* Max output embedding dimension (alloc size) */
-#define MAX_DATA_LEN         1000    /* Maximum valid data length */
-#define SPIN_ITERATIONS      500     /* Busy-wait spin iterations */
-#define IDLE_SLEEP_US        50      /* Sleep time when no requests (microseconds) */
+#define MAX_DATA_LEN         855     /* Maximum valid data length (slot->data is 856 bytes, -1 for '\0') */
+#define SPIN_ITERATIONS      500
 
 /*
  * URL decode function - converts %XX encoding back to original characters
@@ -105,8 +104,8 @@ static int g_fixed_batch = 0;          /* 0=adaptive (EWMA), >0=fixed batch size
 
 /* Inference-Driven Adaptive Batching Parameters */
 #define EWMA_ALPHA             0.1    /* EWMA decay factor (~10 round memory) */
-#define ADAPTIVE_MIN_C0        100.0  /* Minimum c₀ bound (µs) */
-#define ADAPTIVE_MIN_CM        10.0   /* Minimum c_m bound (µs) */
+#define ADAPTIVE_MIN_C0        0.0    /* No artificial floor — let regression learn */
+#define ADAPTIVE_MIN_CM        0.0    /* No artificial floor — let regression learn */
 #define ADAPTIVE_MAX_WAIT_US   2000   /* Maximum single wait cap (µs) */
 #define ADAPTIVE_COLD_ROUNDS   2      /* Rounds before enabling adaptive dispatch */
 
