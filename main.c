@@ -100,11 +100,11 @@ static inline uint64_t get_timestamp_ns(void) {
  * - BATCH_COLLECT_WINDOW_US: Time window to collect concurrent requests
  */
 #define BATCH_MAX_SIZE 8               /* Max concurrent batch size */
-static int g_fixed_batch = 1;          /* 1=greedy (default), 0=EWMA adaptive */
+static int g_fixed_batch = 0;          /* 0=EWMA adaptive (default), >0=fixed batch */
 
 #define EWMA_ALPHA             0.1
 #define ADAPTIVE_MAX_WAIT_US   2000
-#define ADAPTIVE_COLD_ROUNDS   2
+#define ADAPTIVE_COLD_ROUNDS   3
 
 /*
  * Collect PARAM_READY slots (non-blocking, using CAS atomic claim)
@@ -393,10 +393,8 @@ void* simple_inference_reader(void* arg) {
 			if (cal_count >= ADAPTIVE_COLD_ROUNDS && var_n > 0.01) {
 				cm_est = (ew_nt - ew_n * ew_t) / var_n;
 				c0_est = ew_t - cm_est * ew_n;
-				if (!isfinite(cm_est)) cm_est = 0.0;
-				if (!isfinite(c0_est)) c0_est = 0.0;
-				if (c0_est < 0.0) c0_est = 0.0;
-				if (cm_est < 0.0) cm_est = 0.0;
+				if (!isfinite(cm_est) || cm_est < 5.0) cm_est = 5.0;
+				if (!isfinite(c0_est) || c0_est < 50.0) c0_est = 50.0;
 			}
 
 			stat_batches++;
@@ -689,9 +687,9 @@ int main(int argc, char **argv)
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
-	if (getenv("GAZSI_EWMA")) {
-		g_fixed_batch = 0;
-		DOCA_LOG_INFO("EWMA adaptive dispatch enabled");
+	if (getenv("GAZSI_GREEDY")) {
+		g_fixed_batch = 1;
+		DOCA_LOG_INFO("Greedy dispatch (no EWMA wait)");
 	}
 	const char *fb_env = getenv("GAZSI_FIXED_BATCH");
 	if (fb_env) {
