@@ -252,6 +252,9 @@ void* simple_inference_reader(void* arg) {
 	/* EWMA regression: tracks E[n], E[t], E[n²], E[n×t] */
 	double ew_n = 0.0, ew_t = 0.0, ew_n2 = 0.0, ew_nt = 0.0;
 
+	double lambda_ema = 0.0, lambda_var_ema = 0.0;
+	int probe_count = 0;
+
 	long stat_batches = 0, stat_requests = 0, stat_waits = 0;
 
 	while (inference_reader_running && !force_quit) {
@@ -316,8 +319,13 @@ void* simple_inference_reader(void* arg) {
 			}
 		}
 
-		DOCA_LOG_INFO("[ADAPTIVE] dispatch batch=%d λ=%.0f/s c₀=%.0f c_m=%.0f cal=%d",
-		              batch_size, lambda_now * 1e6, c0_est, cm_est, cal_count);
+		if ((stat_batches & 0x1FF) == 0)
+			DOCA_LOG_INFO("[ADAPTIVE] batch=%d λ=%.0f/s c₀=%.0f c_m=%.0f α=%.2f probe_cv=%.2f",
+			              batch_size, lambda_now * 1e6, c0_est, cm_est,
+			              (probe_count > 2 && lambda_ema > 1e-9)
+			              ? 0.05 + 0.45 * fmin(sqrt(lambda_var_ema) / lambda_ema, 1.0)
+			              : EWMA_ALPHA,
+			              (lambda_ema > 1e-9) ? sqrt(lambda_var_ema) / lambda_ema : 0.0);
 
 		uint32_t pending_before = __atomic_load_n(
 			&g_inference_ring_buf->pending_count, __ATOMIC_ACQUIRE);
@@ -340,7 +348,6 @@ void* simple_inference_reader(void* arg) {
 			long elapsed_us = (end_time.tv_sec - start_time.tv_sec) * 1000000 +
 			                  (end_time.tv_nsec - start_time.tv_nsec) / 1000;
 
-			/* Free probe: λ from inference window */
 			uint32_t pending_after = __atomic_load_n(
 				&g_inference_ring_buf->pending_count, __ATOMIC_ACQUIRE);
 			int n_arrived = (int)pending_after - (int)pending_before;
@@ -350,18 +357,34 @@ void* simple_inference_reader(void* arg) {
 				? (double)n_arrived / (double)elapsed_us
 				: 0.0;
 
+			if (probe_count == 0) {
+				lambda_ema = lambda_now;
+				lambda_var_ema = 0.0;
+			} else {
+				double diff = lambda_now - lambda_ema;
+				lambda_var_ema = 0.1 * diff * diff + 0.9 * lambda_var_ema;
+				lambda_ema = 0.1 * lambda_now + 0.9 * lambda_ema;
+			}
+			probe_count++;
+
 			/* EWMA online regression: T(n) = c₀ + n × c_m */
 			double nd = (double)batch_size;
 			double td = (double)elapsed_us;
+
+			double alpha = EWMA_ALPHA;
+			if (probe_count > 2 && lambda_ema > 1e-9) {
+				double cv = sqrt(lambda_var_ema) / lambda_ema;
+				alpha = 0.05 + 0.45 * (cv > 1.0 ? 1.0 : cv);
+			}
 
 			if (cal_count == 0) {
 				ew_n = nd; ew_t = td;
 				ew_n2 = nd * nd; ew_nt = nd * td;
 			} else {
-				ew_n  = EWMA_ALPHA * nd      + (1.0 - EWMA_ALPHA) * ew_n;
-				ew_t  = EWMA_ALPHA * td      + (1.0 - EWMA_ALPHA) * ew_t;
-				ew_n2 = EWMA_ALPHA * nd * nd + (1.0 - EWMA_ALPHA) * ew_n2;
-				ew_nt = EWMA_ALPHA * nd * td + (1.0 - EWMA_ALPHA) * ew_nt;
+				ew_n  = alpha * nd      + (1.0 - alpha) * ew_n;
+				ew_t  = alpha * td      + (1.0 - alpha) * ew_t;
+				ew_n2 = alpha * nd * nd + (1.0 - alpha) * ew_n2;
+				ew_nt = alpha * nd * td + (1.0 - alpha) * ew_nt;
 			}
 			cal_count++;
 
