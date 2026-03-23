@@ -241,11 +241,6 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 
 					/* Q2: push to request_queue for O(1) CPU pickup */
 					gpu_iq_push(&g_inference_ring_buf->request_queue, slot_idx);
-
-					if (g_sem_request_gpu != nullptr) {
-						doca_gpu_dev_semaphore_set_status(g_sem_request_gpu, slot_idx,
-						                                   DOCA_GPU_SEMAPHORE_STATUS_READY);
-					}
 					} else {
 						cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
 							ready_ref(*(uint32_t*)&slot->ready);
