@@ -430,8 +430,12 @@ void* simple_inference_reader(void* arg) {
 						(double)sum_t5t6 / prof_count / 1000.0,
 						(double)(sum_t3t4 + sum_t4t5 + sum_t5t6) / prof_count / 1000.0,
 						drift_pct);
-					if (drift_pct > 15.0)
-						fprintf(stderr, "[DRIFT] inference +%.0f%% from baseline\n", drift_pct);
+					if (drift_pct > 15.0) {
+						fprintf(stderr, "[DRIFT] inference +%.0f%%, resetting profiler baseline\n", drift_pct);
+						baseline_infer_us = avg_infer;
+						sum_t3t4 = sum_t4t5 = sum_t5t6 = 0;
+						prof_count = 0;
+					}
 					if (g_collect_count > 0)
 						fprintf(stderr, "[COLLECT] mode=%s avg=%.1fns count=%lu\n",
 							g_use_scan ? "O(N)-scan" : "O(1)-FIFO",
